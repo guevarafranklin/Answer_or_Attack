@@ -11,7 +11,7 @@ from alembic import context
 # access to the values within the .ini file in use.
 from app.config import settings
 from app.db import Base
-# import app.models  # uncomment once models exist, so autogenerate sees them
+import app.models  # noqa: F401  -- registers every table on Base.metadata for autogenerate
 
 config = context.config
 # Tests point migrations at a scratch database by setting the URL on the
@@ -30,10 +30,18 @@ if config.config_file_name is not None:
 # target_metadata = mymodel.Base.metadata
 target_metadata = Base.metadata
 
-# other values from the config, defined by the needs of env.py,
-# can be acquired:
-# my_important_option = config.get_main_option("my_important_option")
-# ... etc.
+# What autogenerate / `alembic check` compares. CHECK-constraint comparison is
+# opt-in in Alembic (by constraint name), and we want it: the CHECKs in
+# 0001_initial_schema are invariants the models must declare too.
+AUTOGENERATE_OPTS = {
+    "target_metadata": target_metadata,
+    "compare_type": True,
+    "compare_server_default": True,
+    "autogenerate_plugins": [
+        "alembic.autogenerate.*",
+        "alembic.ext.checkconstraint_byname",
+    ],
+}
 
 
 def run_migrations_offline() -> None:
@@ -51,9 +59,9 @@ def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
-        target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        **AUTOGENERATE_OPTS,
     )
 
     with context.begin_transaction():
@@ -61,7 +69,7 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(connection=connection, **AUTOGENERATE_OPTS)
 
     with context.begin_transaction():
         context.run_migrations()
