@@ -83,7 +83,9 @@ class Category(Base):
     created_at: Mapped[TimestampNow]
 
     translations: Mapped[list["CategoryTranslation"]] = relationship(
-        back_populates="category", cascade="all, delete-orphan"
+        back_populates="category",
+        cascade="all, delete-orphan",
+        order_by="CategoryTranslation.locale",
     )
 
 

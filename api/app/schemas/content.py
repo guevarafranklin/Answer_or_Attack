@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.models._common import LOCALES
+from app.rules import OPTION_COUNT, validate_options, validate_stem
 from app.schemas.common import (
     GradeBand,
     Locale,
@@ -14,12 +16,6 @@ from app.schemas.common import (
     Region,
     StudyPackStatus,
 )
-
-# Spec §5.2: a stem longer than 120 chars is unreadable in 10 seconds, and
-# an option longer than 60 chars. Hard product constraints, not style notes.
-MAX_STEM_LEN = 120
-MAX_OPTION_LEN = 60
-OPTION_COUNT = 4
 
 BulkAction = Literal["approve", "reject", "archive"]
 
@@ -38,12 +34,23 @@ class CategoryTranslationRead(ORMModel):
 
 
 class CategoryCreate(BaseModel):
-    """POST /admin/categories {slug, icon, translations:{en:{...}, es:{...}}}"""
+    """POST /admin/categories {slug, icon, translations:{en:{...}, es:{...}}}
+
+    Both locales are required on create (spec §1: one row, two locales).
+    """
 
     slug: str = Field(min_length=1, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
     icon: str | None = None
     sort_order: int = 0
     translations: dict[Locale, CategoryTranslationIn]
+
+    @field_validator("translations")
+    @classmethod
+    def _all_locales_present(cls, value: dict) -> dict:
+        missing = sorted(set(LOCALES) - set(value))
+        if missing:
+            raise ValueError(f"missing translation for locale(s): {', '.join(missing)}")
+        return value
 
 
 class CategoryUpdate(BaseModel):
@@ -84,22 +91,16 @@ class StudyPackRead(ORMModel):
 # ---------- questions ----------
 
 
-def _validate_options(options: list[str]) -> list[str]:
-    if len(options) != OPTION_COUNT:
-        raise ValueError(f"exactly {OPTION_COUNT} options required")
-    if any(len(o) > MAX_OPTION_LEN for o in options):
-        raise ValueError(f"options must be at most {MAX_OPTION_LEN} characters")
-    if len({o.strip().lower() for o in options}) != OPTION_COUNT:
-        raise ValueError("options must be distinct")
-    return options
-
-
 class QuestionTranslationIn(BaseModel):
-    stem: str = Field(min_length=1, max_length=MAX_STEM_LEN)
+    """Text for one locale. Limits come from app.rules so the generation
+    validator (§5.2) and the admin edit path can never disagree."""
+
+    stem: str
     options: list[str]
     explanation: str | None = None
 
-    _check_options = field_validator("options")(_validate_options)
+    _check_stem = field_validator("stem")(validate_stem)
+    _check_options = field_validator("options")(validate_options)
 
 
 class QuestionTranslationRead(ORMModel):

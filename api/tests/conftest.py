@@ -5,6 +5,7 @@ from settings.database_url. It is created if missing and migrated to head
 once per session, so the schema under test is always the real Alembic
 migration chain, never `create_all`.
 """
+import httpx
 import psycopg
 import pytest
 import pytest_asyncio
@@ -14,8 +15,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
+from app.db import get_db
+from app.main import app
 
 ALEMBIC_INI = "alembic.ini"
+ADMIN_TOKEN = "test-admin-token"
 
 _dev_url = make_url(settings.database_url)
 TEST_DB_NAME = f"{_dev_url.database}_test"
@@ -65,3 +69,27 @@ async def db(migrated_db: str):
             await session.close()
             await trans.rollback()
     await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(db: AsyncSession, monkeypatch: pytest.MonkeyPatch):
+    """httpx client speaking ASGI to the app, with `get_db` overridden to the
+    test session so route handlers write into the same rolled-back
+    transaction the test reads from. The admin token is set to ADMIN_TOKEN."""
+    monkeypatch.setattr(settings, "admin_token", ADMIN_TOKEN)
+
+    async def _override_get_db():
+        yield db
+
+    app.dependency_overrides[get_db] = _override_get_db
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def admin_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
