@@ -22,8 +22,8 @@ from app.schemas.generation import (
     GenerationStats,
 )
 from app.schemas.sessions import (
-    SessionGenerateRequest,
-    SessionGenerateResponse,
+    SessionCreateRequest,
+    SessionCreateResponse,
     SessionPlayerRead,
     SessionQuestionOut,
     SessionRead,
@@ -58,8 +58,8 @@ __all__ = [
     "QuestionTranslationIn",
     "QuestionTranslationRead",
     "QuestionUpdate",
-    "SessionGenerateRequest",
-    "SessionGenerateResponse",
+    "SessionCreateRequest",
+    "SessionCreateResponse",
     "SessionPlayerRead",
     "SessionQuestionOut",
     "SessionRead",

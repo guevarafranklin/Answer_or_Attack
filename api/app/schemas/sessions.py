@@ -1,4 +1,6 @@
-"""Sessions (spec §4 Session content). Tables exist now; the engine is Phase 2.
+"""Sessions (Phase 2 spec §4, §6): the lobby is created over HTTP and the
+question set is drawn at `start` into per-category pools plus a block
+reserve.
 
 `session_players.starting_xp` is secret until the reveal (spec §3.1) and is
 guarded here, in the serializer: no schema in this module declares it, and
@@ -6,25 +8,31 @@ guarded here, in the serializer: no schema in this module declares it, and
 """
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.common import Locale, ORMModel, Region, SessionMode, SessionStatus
 
-DifficultyCurve = Literal["ramp", "flat"]
 
+class SessionCreateRequest(BaseModel):
+    """POST /sessions — a lobby, no questions yet (Phase 2 §4).
 
-class SessionGenerateRequest(BaseModel):
-    """POST /sessions/generate"""
+    `config_overrides` is any subset of GameConfig fields (question_count
+    included); the service validates it through GameConfig.from_overrides,
+    so an unknown key or a bad value is a 422."""
 
     category_ids: list[uuid.UUID] = Field(default_factory=list)
     locale: Locale
     region: Region = "global"
-    question_count: int = Field(default=15, ge=1, le=50)
-    difficulty_curve: DifficultyCurve = "ramp"
     mode: SessionMode = "house"
     pack_id: uuid.UUID | None = None
+    config_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionCreateResponse(BaseModel):
+    session_id: uuid.UUID
+    join_code: str
 
 
 class SessionQuestionOut(BaseModel):
@@ -39,24 +47,23 @@ class SessionQuestionOut(BaseModel):
 
 class SessionQuestionServer(SessionQuestionOut):
     """The server's copy of the same (Redis `session:{id}:questions`):
-    `correct_index` is the position in the *shuffled* options."""
+    `correct_index` is the position in the *shuffled* options, `pool` is
+    the category id or 'block' (§6), `difficulty` feeds the engine's
+    reserve fallback."""
 
     correct_index: int = Field(ge=0, le=3)
+    pool: str
+    difficulty: int = Field(ge=1, le=5)
 
 
 class SessionQuestionsCache(BaseModel):
     """Payload cached at session:{id}:questions for 2 hours (spec §4), so
-    Phase 2 scores a round without a DB query."""
+    Phase 2 scores a round without a DB query. `short_by` is the pool
+    shortfall the draw reported (None when every pool was filled)."""
 
     session_id: uuid.UUID
     locale: Locale
     questions: list[SessionQuestionServer]
-
-
-class SessionGenerateResponse(BaseModel):
-    session_id: uuid.UUID
-    questions: list[SessionQuestionOut]
-    # Set when the pool was too small to fill the request (spec §4).
     short_by: int | None = None
 
 
@@ -75,6 +82,12 @@ class SessionPlayerRead(ORMModel):
 
 
 class SessionRead(ORMModel):
+    """Public view of a session. `rng_seed` is intentionally absent and
+    rejected if supplied: with the seed a client could predict the board,
+    the auto-picks and everyone's starting XP."""
+
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
     id: uuid.UUID
     host_id: uuid.UUID | None
     join_code: str
@@ -85,6 +98,8 @@ class SessionRead(ORMModel):
     category_ids: list[uuid.UUID]
     question_count: int
     status: SessionStatus
+    config_overrides: dict[str, Any]
+    resolved_config: dict[str, Any] | None
     created_at: datetime
     started_at: datetime | None
     ended_at: datetime | None

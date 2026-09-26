@@ -62,3 +62,7 @@ def test_session_player_serializer_drops_starting_xp():
     assert "starting_xp" not in SessionRead.model_json_schema()["$defs"]["SessionPlayerRead"][
         "properties"
     ]
+    # The session's rng seed would let a client predict the board, the
+    # auto-picks and everyone's starting XP: same treatment.
+    assert "rng_seed" not in SessionRead.model_json_schema()["properties"]
+    assert SessionRead.model_config["extra"] == "forbid"

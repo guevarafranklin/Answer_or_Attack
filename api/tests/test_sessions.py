@@ -1,4 +1,5 @@
-"""§9 step 8: POST /sessions/generate (spec §4 Session content)."""
+"""Phase 2 §10 step 3: POST /sessions makes a lobby; the draw at start
+builds per-category pools and the block reserve (spec §6)."""
 import json
 import time
 import uuid
@@ -7,12 +8,14 @@ from datetime import timedelta
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import PLAYER_HEADER
-from app.cache import SESSION_QUESTIONS_TTL, get_redis
-from app.main import app
+from app.cache import SESSION_QUESTIONS_TTL
+from app.game.config import GameConfig
+from app.game import seed as seed_mod
+from app.game.engine import Question as EngineQuestion
 from app.models import (
     Category,
     GameSession,
@@ -22,9 +25,9 @@ from app.models import (
     StudyPack,
     User,
 )
+from app.models.sessions import BLOCK_POOL
 from app.services import sessions as svc
 from app.services.validation import content_hash
-
 
 class FakeRedis:
     def __init__(self):
@@ -35,14 +38,6 @@ class FakeRedis:
         if self.down:
             raise ConnectionError("redis is down")
         self.store[key] = (value, ex)
-
-
-@pytest.fixture
-def redis():
-    fake = FakeRedis()
-    app.dependency_overrides[get_redis] = lambda: fake
-    yield fake
-    app.dependency_overrides.pop(get_redis, None)
 
 
 @pytest_asyncio.fixture
@@ -60,7 +55,11 @@ def headers(player: User) -> dict[str, str]:
 
 @pytest_asyncio.fixture
 async def category(db: AsyncSession) -> Category:
-    cat = Category(slug=f"c-{uuid.uuid4().hex[:6]}")
+    return await _category(db)
+
+
+async def _category(db: AsyncSession, slug: str | None = None) -> Category:
+    cat = Category(slug=slug or f"c-{uuid.uuid4().hex[:6]}")
     db.add(cat)
     await db.flush()
     return cat
@@ -112,33 +111,285 @@ async def _bank(
     return ids
 
 
+async def _difficulties(db: AsyncSession) -> dict[uuid.UUID, int]:
+    return {q.id: q.difficulty for q in (await db.execute(select(Question))).scalars()}
+
+
 def _request(**overrides) -> dict:
-    return {"locale": "en", "question_count": 15, **overrides}
+    """Request body; `question_count`/`max_players` shortcuts go into
+    config_overrides (question_count defaults to 15)."""
+    config = {"question_count": overrides.pop("question_count", 15)}
+    if "max_players" in overrides:
+        config["max_players"] = overrides.pop("max_players")
+    config.update(overrides.pop("config_overrides", {}))
+    return {"locale": "en", "config_overrides": config, **overrides}
 
 
-async def _generate(client: AsyncClient, headers, **overrides) -> dict:
-    resp = await client.post("/sessions/generate", json=_request(**overrides), headers=headers)
+async def _create(client: AsyncClient, headers, **overrides) -> dict:
+    resp = await client.post("/sessions", json=_request(**overrides), headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()
 
 
-def _ids(body: dict) -> list[uuid.UUID]:
-    return [uuid.UUID(q["id"]) for q in body["questions"]]
+async def _lobby(db: AsyncSession, host: User, **overrides) -> GameSession:
+    req = svc.SessionCreateRequest(**_request(**overrides))
+    return await svc.create_session(db, req, host)
+
+
+async def _draw(db: AsyncSession, session: GameSession, present: int = 4, **kw) -> svc.Draw:
+    return await svc.draw_at_start(db, session, present_count=present, **kw)
+
+
+def _all_ids(draw: svc.Draw) -> list[str]:
+    return [q.id for qs in draw.pools.values() for q in qs] + [q.id for q in draw.block_reserve]
+
+
+async def _stored(db: AsyncSession, session_id: uuid.UUID) -> list[SessionQuestion]:
+    rows = await db.execute(
+        select(SessionQuestion)
+        .where(SessionQuestion.session_id == session_id)
+        .order_by(SessionQuestion.ordinal)
+    )
+    return list(rows.scalars())
+
+
+# ---------- POST /sessions ----------
 
 
 @pytest.mark.asyncio
-async def test_requires_a_player(client: AsyncClient, redis):
-    resp = await client.post("/sessions/generate", json=_request())
+async def test_requires_a_player(client: AsyncClient):
+    resp = await client.post("/sessions", json=_request())
     assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_house_mode_never_returns_pack_or_unlive_questions(
-    client: AsyncClient, db: AsyncSession, redis, headers, player, category
+async def test_create_makes_a_lobby_without_questions(
+    client: AsyncClient, db: AsyncSession, headers, player, category
 ):
-    """Spec §8: house-pool queries provably never return pack_id IS NOT
-    NULL rows. The house pool is exactly 20 live questions, so a 20-draw
-    must return exactly those — pack and non-live questions never leak."""
+    """The draw happens at start, not here: a fresh lobby has no rows in
+    session_questions even with a full bank available."""
+    await _bank(db, category, 30)
+    body = await _create(client, headers, region="latam", category_ids=[str(category.id)])
+    session = await db.get(GameSession, uuid.UUID(body["session_id"]))
+    assert body == {"session_id": str(session.id), "join_code": session.join_code}
+    assert (session.host_id, session.locale, session.region) == (player.id, "en", "latam")
+    assert (session.mode, session.pack_id, session.question_count) == ("house", None, 15)
+    assert session.category_ids == [category.id]
+    assert session.status == "lobby" and session.started_at is None
+    assert len(session.join_code) == svc.JOIN_CODE_LENGTH
+    assert set(session.join_code) <= set(svc.JOIN_CODE_ALPHABET)
+    assert await _stored(db, session.id) == []
+
+
+@pytest.mark.asyncio
+async def test_config_overrides_are_validated_and_stored(
+    client: AsyncClient, db: AsyncSession, headers
+):
+    body = await _create(client, headers, config_overrides={"question_count": 20, "max_tokens": 3})
+    session = await db.get(GameSession, uuid.UUID(body["session_id"]))
+    assert session.config_overrides == {"question_count": 20, "max_tokens": 3}
+    assert session.question_count == 20  # derived from the overrides
+    assert session.resolved_config is None and session.rng_seed is None
+
+    plain = await client.post("/sessions", json={"locale": "en"}, headers=headers)
+    assert plain.status_code == 201
+    assert (await db.get(GameSession, uuid.UUID(plain.json()["session_id"]))).config_overrides == {}
+
+    for bad in ({"questoin_count": 20}, {"question_count": 0}, {"starting_xp_choices": []}):
+        resp = await client.post(
+            "/sessions", json={"locale": "en", "config_overrides": bad}, headers=headers
+        )
+        assert resp.status_code == 422, bad
+        assert resp.json()["detail"].startswith("config_overrides: ")
+    assert await db.scalar(select(func.count()).select_from(GameSession)) == 2
+
+
+@pytest.mark.asyncio
+async def test_pack_id_must_match_mode(client: AsyncClient, headers):
+    no_pack = await client.post("/sessions", json=_request(mode="study"), headers=headers)
+    house_with_pack = await client.post(
+        "/sessions", json=_request(pack_id=str(uuid.uuid4())), headers=headers
+    )
+    assert (no_pack.status_code, house_with_pack.status_code) == (422, 422)
+
+
+@pytest.mark.asyncio
+async def test_join_code_collision_is_retried(
+    client: AsyncClient, db: AsyncSession, headers, monkeypatch
+):
+    first = await _create(client, headers)
+    taken = (await db.get(GameSession, uuid.UUID(first["session_id"]))).join_code
+    codes = iter([taken, "FRESH1"])
+    monkeypatch.setattr(svc, "new_join_code", lambda: next(codes))
+
+    second = await _create(client, headers)
+    assert second["join_code"] == "FRESH1"
+
+
+# ---------- the draw ----------
+
+
+def test_pool_size_is_ceil_split_plus_two():
+    assert svc.pool_size(15, 1) == 17
+    assert svc.pool_size(15, 4) == 6  # ceil(3.75) + 2
+    assert svc.pool_size(15, 5) == 5
+    assert svc.pool_size(16, 5) == 6
+    assert svc.ramp_sizes(15) == [4, 7, 4]
+    assert svc.ramp_sizes(20) == [6, 9, 5]
+    assert svc.ramp_sizes(5) == [2, 2, 1]
+
+
+@pytest.mark.asyncio
+async def test_pools_per_category_ramped_and_reserve_of_max_players(
+    db: AsyncSession, player
+):
+    """Five categories with a deep bank, question_count 15, max_players 8:
+    five pools of ceil(15/5)+2 = 5 questions each, ramped easy → hard,
+    and a reserve of 8 difficulty-2–3 questions. Nothing is drawn twice
+    and every question comes from a selected category."""
+    cats = [await _category(db) for _ in range(5)]
+    banks = {c.id: set(await _bank(db, c, 40)) for c in cats}
+    await _bank(db, await _category(db, "unselected"), 40)
+    session = await _lobby(db, player, category_ids=[str(c.id) for c in cats], max_players=8)
+    difficulty = await _difficulties(db)
+
+    draw = await _draw(db, session)
+    assert set(draw.pools) == {str(c.id) for c in cats}
+    for cid, pool in draw.pools.items():
+        assert len(pool) == 5
+        assert {uuid.UUID(q.id) for q in pool} <= banks[uuid.UUID(cid)]
+        assert all(q.category_id == cid for q in pool)
+        curve = [q.difficulty for q in pool]
+        assert curve == sorted(curve) == [difficulty[uuid.UUID(q.id)] for q in pool]
+        assert (sum(d <= 2 for d in curve), sum(d == 3 for d in curve), sum(d >= 4 for d in curve)) == (2, 2, 1)
+    assert len(draw.block_reserve) == 8
+    assert all(q.difficulty in (2, 3) for q in draw.block_reserve)
+    assert {uuid.UUID(q.id) for q in draw.block_reserve} <= set().union(*banks.values())
+    ids = _all_ids(draw)
+    assert len(ids) == len(set(ids)) == 5 * 5 + 8
+    assert draw.short_by is None
+
+
+@pytest.mark.asyncio
+async def test_rows_carry_pool_and_ordinals_run_through_pools_then_reserve(
+    db: AsyncSession, player
+):
+    cats = [await _category(db) for _ in range(3)]
+    for c in cats:
+        await _bank(db, c, 20)
+    session = await _lobby(
+        db, player, question_count=9, category_ids=[str(c.id) for c in cats], max_players=4
+    )
+
+    draw = await _draw(db, session)
+    rows = await _stored(db, session.id)
+    assert [r.ordinal for r in rows] == list(range(3 * 5 + 4))
+    expected = [(str(cid), uuid.UUID(q.id)) for cid, qs in draw.pools.items() for q in qs]
+    expected += [(BLOCK_POOL, uuid.UUID(q.id)) for q in draw.block_reserve]
+    assert [(r.pool, r.question_id) for r in rows] == expected
+    # Cache and rows agree on ordinal, pool and difficulty.
+    assert [(q.ordinal, q.pool) for q in draw.cache.questions] == [(r.ordinal, r.pool) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_engine_questions_match_the_stored_shuffle(db: AsyncSession, player, category):
+    """`correct_option` in the engine's Question is the position after the
+    per-session shuffle: option_order[correct_option] is the bank's
+    correct_index, and the cached options are the originals permuted."""
+    await _bank(db, category, 60)  # 12 per difficulty: room for a full reserve
+    originals = {
+        t.question_id: t
+        for t in (
+            await db.execute(select(QuestionTranslation).where(QuestionTranslation.locale == "en"))
+        ).scalars()
+    }
+    correct = {q.id: q.correct_index for q in (await db.execute(select(Question))).scalars()}
+    session = await _lobby(db, player, max_players=4)
+
+    draw = await _draw(db, session)
+    stored = {r.ordinal: r for r in await _stored(db, session.id)}
+    engine = {q.id: q for q in draw.pools[str(category.id)] + draw.block_reserve}
+    assert len(engine) == 17 + 4
+    for cached in draw.cache.questions:
+        qid = cached.id
+        order = stored[cached.ordinal].option_order
+        assert sorted(order) == [0, 1, 2, 3]
+        assert cached.options == [originals[qid].options[j] for j in order]
+        assert cached.stem == originals[qid].stem
+        assert order[cached.correct_index] == correct[qid]
+        eq = engine[str(qid)]
+        assert eq == EngineQuestion(str(qid), str(category.id), cached.difficulty, cached.correct_index)
+    # 21 independent shuffles of 4 options: all identity is a 24^-21 event.
+    assert any(r.option_order != [0, 1, 2, 3] for r in stored.values())
+
+
+@pytest.mark.asyncio
+async def test_start_writes_seed_and_resolved_config(db: AsyncSession, player, category):
+    """The draw resolves the config for the players present (8 → the
+    4–8 starting-XP tier) on top of the host's overrides, picks a seed,
+    and stores both on the row; the Draw carries the same."""
+    await _bank(db, category, 30)
+    session = await _lobby(db, player, config_overrides={"question_count": 5, "attack_cost": 2})
+    assert session.resolved_config is None and session.rng_seed is None
+
+    draw = await _draw(db, session, present=8)
+    assert session.rng_seed == draw.seed and 0 <= draw.seed < 2**63
+    expected = GameConfig.from_overrides(
+        {"question_count": 5, "attack_cost": 2}, starting_xp_choices=(10, 12, 15)
+    )
+    assert draw.config == expected
+    assert session.resolved_config == json.loads(json.dumps(expected.summary()))
+    assert GameConfig.from_overrides(session.resolved_config) == expected
+    assert session.config_overrides == {"question_count": 5, "attack_cost": 2}  # untouched
+
+    bigger = await _draw(db, await _lobby(db, player), present=9)
+    assert bigger.config.starting_xp_choices == (10, 11, 13)
+    pinned = await _draw(
+        db, await _lobby(db, player, config_overrides={"starting_xp_choices": [10, 18, 30]}), present=9
+    )
+    assert pinned.config.starting_xp_choices == (10, 18, 30)
+
+
+@pytest.mark.asyncio
+async def test_seed_fixes_the_option_shuffle(db: AsyncSession, player, category):
+    """Given the seed, the shuffle is reproducible (the questions come
+    from the DB's random(), and session_questions records which); the
+    engine stream from the same seed is independent of the draw's."""
+    await _bank(db, category, 10)
+    a = await _draw(db, await _lobby(db, player, question_count=1, max_players=2), seed=7)
+    b = await _draw(db, await _lobby(db, player, question_count=1, max_players=2), seed=7)
+    assert a.seed == b.seed == 7
+    orders_a = [r.option_order for r in await _stored(db, a.cache.session_id)]
+    orders_b = [r.option_order for r in await _stored(db, b.cache.session_id)]
+    assert orders_a == orders_b and len(orders_a) == 3 + 2
+    rng = seed_mod.draw_rng(7)
+    assert orders_a == [svc.shuffle_options(rng) for _ in range(5)]
+    assert seed_mod.engine_rng(7).random() != seed_mod.draw_rng(7).random()
+    assert seed_mod.engine_rng(7).random() == seed_mod.engine_rng(7).random()
+
+
+@pytest.mark.asyncio
+async def test_empty_category_ids_means_every_category_with_questions(
+    db: AsyncSession, player
+):
+    cats = [await _category(db) for _ in range(4)]
+    for c in cats[:3]:
+        await _bank(db, c, 20)
+    await _bank(db, cats[3], 20, status="pending")  # nothing eligible here
+    session = await _lobby(db, player, question_count=15, max_players=4)
+
+    draw = await _draw(db, session)
+    assert set(draw.pools) == {str(c.id) for c in cats[:3]}
+    assert all(len(pool) == 7 for pool in draw.pools.values())  # ceil(15/3) + 2
+    assert session.category_ids == []  # the row keeps what the host asked for
+
+
+@pytest.mark.asyncio
+async def test_house_mode_never_draws_pack_or_unlive_questions(
+    db: AsyncSession, player, category
+):
+    """Phase 1 §8, still true: the house pool is exactly the 20 live house
+    questions, so a draw wanting more than 20 returns exactly those."""
     pack = StudyPack(owner_id=player.id, title="my notes", locale="en")
     db.add(pack)
     await db.flush()
@@ -147,247 +398,154 @@ async def test_house_mode_never_returns_pack_or_unlive_questions(
     for status in ("pending", "archived", "rejected"):
         await _bank(db, category, 5, status=status)
 
-    for _ in range(5):
-        body = await _generate(client, headers, question_count=20)
-        assert set(_ids(body)) == house
-        assert body["short_by"] is None
+    for _ in range(3):
+        draw = await _draw(db, await _lobby(db, player, question_count=30, max_players=20))
+        assert {uuid.UUID(i) for i in _all_ids(draw)} == house
 
 
 @pytest.mark.asyncio
-async def test_study_mode_draws_from_the_pack(
-    client: AsyncClient, db: AsyncSession, redis, headers, player, category
-):
+async def test_study_mode_draws_from_the_pack(db: AsyncSession, player, category):
     pack = StudyPack(owner_id=player.id, title="my notes", locale="en")
     db.add(pack)
     await db.flush()
     await _bank(db, category, 20)
     mine = set(await _bank(db, category, 10, pack_id=pack.id, status="pending"))
 
-    body = await _generate(client, headers, mode="study", pack_id=str(pack.id), question_count=10)
-    assert set(_ids(body)) == mine
-    session = await db.get(GameSession, uuid.UUID(body["session_id"]))
-    assert (session.mode, session.pack_id) == ("study", pack.id)
-
-
-@pytest.mark.asyncio
-async def test_pack_id_must_match_mode(client: AsyncClient, redis, headers):
-    no_pack = await client.post(
-        "/sessions/generate", json=_request(mode="study"), headers=headers
+    session = await _lobby(
+        db, player, mode="study", pack_id=str(pack.id), question_count=10, max_players=20
     )
-    house_with_pack = await client.post(
-        "/sessions/generate", json=_request(pack_id=str(uuid.uuid4())), headers=headers
+    draw = await _draw(db, session)
+    assert {uuid.UUID(i) for i in _all_ids(draw)} == mine
+    assert len(draw.pools[str(category.id)]) == 10  # wanted 12: short by 2, reserve empty
+    assert draw.block_reserve == [] and draw.short_by == 2
+
+
+@pytest.mark.asyncio
+async def test_thin_band_is_filled_from_the_rest_of_the_category(
+    db: AsyncSession, player, category
+):
+    """Only difficulty-3 questions in the category: the ramp still fills
+    the pool; and a reserve draw never steals from a pool."""
+    await _bank(db, category, 30, difficulty=3)
+    session = await _lobby(db, player, question_count=15, max_players=20)
+    draw = await _draw(db, session)
+    assert len(draw.pools[str(category.id)]) == 17 and draw.short_by is None
+    assert len(draw.block_reserve) == 13  # the 30 - 17 left over
+    ids = _all_ids(draw)
+    assert len(ids) == len(set(ids)) == 30
+
+
+@pytest.mark.asyncio
+async def test_reserve_takes_only_difficulty_2_and_3(db: AsyncSession, player, category):
+    for d in (1, 4, 5):
+        await _bank(db, category, 10, difficulty=d)
+    mid = set(await _bank(db, category, 3, difficulty=2)) | set(await _bank(db, category, 3, difficulty=3))
+    session = await _lobby(db, player, question_count=1, max_players=20)  # pool of 3
+    draw = await _draw(db, session)
+    pool_ids = {uuid.UUID(q.id) for q in draw.pools[str(category.id)]}
+    reserve_ids = {uuid.UUID(q.id) for q in draw.block_reserve}
+    assert reserve_ids <= mid and not (reserve_ids & pool_ids)
+    assert len(reserve_ids) == len(mid - pool_ids)
+
+
+@pytest.mark.asyncio
+async def test_short_by_counts_the_pools_shortfall(db: AsyncSession, player):
+    """Two categories, one with 3 questions and one with none: pools of 7
+    wanted 14, got 3, short by 11. The reserve's own shortfall is not
+    reported (the engine falls back to the pools)."""
+    thin, empty = await _category(db), await _category(db)
+    ids = set(await _bank(db, thin, 3, locales=("en",)))
+    session = await _lobby(
+        db, player, question_count=10, category_ids=[str(thin.id), str(empty.id)], max_players=20
     )
-    assert (no_pack.status_code, house_with_pack.status_code) == (422, 422)
+    draw = await _draw(db, session)
+    assert {uuid.UUID(q.id) for q in draw.pools[str(thin.id)]} == ids
+    assert draw.pools[str(empty.id)] == []
+    assert draw.block_reserve == []
+    assert draw.short_by == draw.cache.short_by == 11
+
+    nothing = await _draw(db, await _lobby(db, player, category_ids=[str(empty.id)]))
+    assert nothing.pools == {str(empty.id): []} and nothing.short_by == 17
+
+    # No category has an eligible question in Spanish: no pools at all.
+    no_categories = await _draw(db, await _lobby(db, player, locale="es"))
+    assert no_categories.pools == {} and no_categories.short_by == 15
 
 
 @pytest.mark.asyncio
-async def test_no_duplicates_and_ramp_order(
-    client: AsyncClient, db: AsyncSession, redis, headers, category
-):
-    """A 30-question ramp over a 30-question pool must use every question
-    once, ordered easy → hard, and persist the set in that order."""
-    pool = set(await _bank(db, category, 30))
-    body = await _generate(client, headers, question_count=30)
-    ids = _ids(body)
-    assert len(ids) == len(set(ids)) == 30 and set(ids) == pool
-    assert [q["ordinal"] for q in body["questions"]] == list(range(30))
-    difficulty = {q.id: q.difficulty for q in (await db.execute(select(Question))).scalars()}
-    curve = [difficulty[i] for i in ids]
-    assert curve == sorted(curve)
-
-    rows = (
-        await db.execute(
-            select(SessionQuestion)
-            .where(SessionQuestion.session_id == uuid.UUID(body["session_id"]))
-            .order_by(SessionQuestion.ordinal)
-        )
-    ).scalars().all()
-    assert [r.question_id for r in rows] == ids
-
-
-@pytest.mark.asyncio
-async def test_ramp_shares_and_fill_from_other_bands(
-    client: AsyncClient, db: AsyncSession, redis, headers, category
-):
-    """Spec §4: ~30% difficulty 1–2, ~45% difficulty 3, ~25% difficulty 4–5.
-    With a deep pool the bands come out as planned; when one band is thin
-    the gap is filled from the rest rather than reported as short."""
-    assert svc.ramp_sizes(15) == [4, 7, 4]
-    assert svc.ramp_sizes(20) == [6, 9, 5]
-    for d in range(1, 6):
-        await _bank(db, category, 20, difficulty=d)
-    difficulty = {q.id: q.difficulty for q in (await db.execute(select(Question))).scalars()}
-
-    body = await _generate(client, headers, question_count=20)
-    bands = [difficulty[i] for i in _ids(body)]
-    assert (
-        sum(d <= 2 for d in bands),
-        sum(d == 3 for d in bands),
-        sum(d >= 4 for d in bands),
-    ) == (6, 9, 5)
-
-    # Only difficulty-3 questions in this category: the ramp still fills.
-    only_mid = Category(slug="mid")
-    db.add(only_mid)
-    await db.flush()
-    await _bank(db, only_mid, 15, difficulty=3)
-    body = await _generate(client, headers, category_ids=[str(only_mid.id)], question_count=15)
-    assert len(_ids(body)) == 15 and body["short_by"] is None
-
-
-@pytest.mark.asyncio
-async def test_short_by_when_the_pool_is_too_small(
-    client: AsyncClient, db: AsyncSession, redis, headers, category
-):
-    pool = set(await _bank(db, category, 7))
-    for curve in ("ramp", "flat"):
-        body = await _generate(client, headers, question_count=15, difficulty_curve=curve)
-        assert set(_ids(body)) == pool and len(_ids(body)) == 7, curve
-        assert body["short_by"] == 8
-
-    empty = Category(slug="empty")
-    db.add(empty)
-    await db.flush()
-    body = await _generate(client, headers, category_ids=[str(empty.id)], question_count=15)
-    assert body["questions"] == [] and body["short_by"] == 15
-
-
-@pytest.mark.asyncio
-async def test_filters_region_category_and_locale(
-    client: AsyncClient, db: AsyncSession, redis, headers, category
-):
-    other = Category(slug="other")
-    db.add(other)
-    await db.flush()
+async def test_filters_region_and_locale(db: AsyncSession, player, category):
+    other = await _category(db, "other")
     wanted = set(await _bank(db, category, 5, region="us"))
     wanted |= set(await _bank(db, category, 5, region="global"))
     await _bank(db, category, 5, region="latam")
     await _bank(db, other, 5)
     await _bank(db, category, 5, locales=("en",))  # no Spanish text
 
-    body = await _generate(
-        client,
-        headers,
+    session = await _lobby(
+        db,
+        player,
         locale="es",
         region="us",
         category_ids=[str(category.id)],
         question_count=30,
+        max_players=20,
     )
-    assert set(_ids(body)) == wanted
-    assert all(q["stem"].startswith("es ") for q in body["questions"])
-    assert body["short_by"] == 20
+    draw = await _draw(db, session)
+    assert {uuid.UUID(i) for i in _all_ids(draw)} == wanted
+    assert all(q.stem.startswith("es ") for q in draw.cache.questions)
+    assert draw.cache.locale == "es"
 
 
 @pytest.mark.asyncio
-async def test_options_are_shuffled_per_session_and_stored(
-    client: AsyncClient, db: AsyncSession, redis, headers, category
-):
-    """The client sees a permutation of each question's options and no
-    correct_index; session_questions.option_order maps the shown position
-    back to the original, and the cached copy carries the shifted
-    correct_index so an answer can be scored from either."""
-    await _bank(db, category, 15)
-    originals = {
-        t.question_id: t
-        for t in (
-            await db.execute(select(QuestionTranslation).where(QuestionTranslation.locale == "en"))
-        ).scalars()
-    }
-    correct = {q.id: q.correct_index for q in (await db.execute(select(Question))).scalars()}
+async def test_draw_happens_once(db: AsyncSession, player, category):
+    await _bank(db, category, 60)
+    session = await _lobby(db, player, max_players=4)
+    await _draw(db, session)
+    with pytest.raises(svc.AlreadyDrawn):
+        await _draw(db, session)
+    assert len(await _stored(db, session.id)) == 21
 
-    body = await _generate(client, headers)
-    assert len(body["questions"]) == 15
-    assert not any("correct_index" in q for q in body["questions"])
-    session_id = uuid.UUID(body["session_id"])
-    stored = {
-        r.ordinal: r
-        for r in (
-            await db.execute(
-                select(SessionQuestion).where(SessionQuestion.session_id == session_id)
-            )
-        ).scalars()
-    }
-    cached_raw, ttl = redis.store[f"session:{session_id}:questions"]
-    cached = json.loads(cached_raw)
+
+@pytest.mark.asyncio
+async def test_cache_payload_and_redis_down(db: AsyncSession, player, category):
+    await _bank(db, category, 60)
+    draw = await _draw(db, await _lobby(db, player, max_players=4))
+    redis = FakeRedis()
+
+    assert await svc.cache_questions(redis, draw.cache) is True
+    raw, ttl = redis.store[f"session:{draw.cache.session_id}:questions"]
     assert ttl == SESSION_QUESTIONS_TTL == timedelta(hours=2)
-    assert (cached["session_id"], cached["locale"]) == (str(session_id), "en")
+    cached = json.loads(raw)
+    assert (cached["session_id"], cached["locale"], cached["short_by"]) == (
+        str(draw.cache.session_id), "en", None
+    )
+    assert len(cached["questions"]) == 21
+    assert {q["pool"] for q in cached["questions"]} == {str(category.id), BLOCK_POOL}
+    assert set(cached["questions"][0]) == {
+        "id", "stem", "options", "ordinal", "correct_index", "pool", "difficulty"
+    }
 
-    for shown, server in zip(body["questions"], cached["questions"]):
-        qid = uuid.UUID(shown["id"])
-        order = stored[shown["ordinal"]].option_order
-        assert sorted(order) == [0, 1, 2, 3]
-        assert shown["options"] == [originals[qid].options[j] for j in order]
-        assert shown["stem"] == originals[qid].stem
-        # Cached copy = what the client saw + where the right answer went.
-        assert {k: v for k, v in server.items() if k != "correct_index"} == shown
-        assert order[server["correct_index"]] == correct[qid]
-        assert shown["options"][server["correct_index"]] == (
-            originals[qid].options[correct[qid]]
-        )
-    # 15 independent shuffles of 4 options: all identity is a 24^-15 event.
-    assert any(r.option_order != [0, 1, 2, 3] for r in stored.values())
-
-
-@pytest.mark.asyncio
-async def test_session_row(
-    client: AsyncClient, db: AsyncSession, redis, headers, player, category
-):
-    await _bank(db, category, 15)
-    body = await _generate(client, headers, region="latam", category_ids=[str(category.id)])
-    session = await db.get(GameSession, uuid.UUID(body["session_id"]))
-    assert (session.host_id, session.locale, session.region) == (player.id, "en", "latam")
-    assert (session.mode, session.pack_id, session.question_count) == ("house", None, 15)
-    assert session.category_ids == [category.id]
-    # Phase 2 owns lobby -> running; the draw does not start the game.
-    assert session.status == "lobby" and session.started_at is None
-    assert len(session.join_code) == svc.JOIN_CODE_LENGTH
-    assert set(session.join_code) <= set(svc.JOIN_CODE_ALPHABET)
-
-
-@pytest.mark.asyncio
-async def test_join_code_collision_is_retried(
-    client: AsyncClient, db: AsyncSession, redis, headers, category, monkeypatch
-):
-    await _bank(db, category, 5)
-    first = await _generate(client, headers, question_count=5)
-    taken = (await db.get(GameSession, uuid.UUID(first["session_id"]))).join_code
-    codes = iter([taken, "FRESH1"])
-    monkeypatch.setattr(svc, "new_join_code", lambda: next(codes))
-
-    second = await _generate(client, headers, question_count=5)
-    session = await db.get(GameSession, uuid.UUID(second["session_id"]))
-    assert session.join_code == "FRESH1"
-    assert len(session.questions) == 5
-
-
-@pytest.mark.asyncio
-async def test_redis_down_still_creates_the_session(
-    client: AsyncClient, db: AsyncSession, redis, headers, category
-):
-    await _bank(db, category, 15)
     redis.down = True
-    body = await _generate(client, headers)
-    assert len(body["questions"]) == 15
-    assert await db.get(GameSession, uuid.UUID(body["session_id"])) is not None
-    assert redis.store == {}
+    assert await svc.cache_questions(redis, draw.cache) is False  # logged, not raised
 
 
 @pytest.mark.asyncio
-async def test_generate_under_200ms_with_5000_live_questions(
-    client: AsyncClient, db: AsyncSession, redis, headers, category
-):
-    """Spec §8: 15 non-duplicate live questions in under 200ms with 5,000
-    questions in the bank. Timed through the ASGI client, after one
-    warm-up call so SQLAlchemy's statement cache is not what is measured."""
-    await _bank(db, category, 5_000)
-    await _bank(db, category, 500, status="pending")
-    await _generate(client, headers, locale="es")
+async def test_draw_under_200ms_with_5000_live_questions(db: AsyncSession, player):
+    """Phase 1 §8's budget, kept for the new shape: 5,000 live questions
+    over 5 categories, pools + reserve drawn in under 200ms after one
+    warm-up so SQLAlchemy's statement cache is not what is measured."""
+    cats = [await _category(db) for _ in range(5)]
+    for c in cats:
+        await _bank(db, c, 1_000)
+        await _bank(db, c, 100, status="pending")
+    await _draw(db, await _lobby(db, player, locale="es"))
 
+    session = await _lobby(db, player)
     started = time.perf_counter()
-    body = await _generate(client, headers)
+    draw = await _draw(db, session)
     elapsed = time.perf_counter() - started
 
-    ids = _ids(body)
-    assert len(ids) == len(set(ids)) == 15 and body["short_by"] is None
+    ids = _all_ids(draw)
+    assert len(ids) == len(set(ids)) == 5 * 5 + 20 and draw.short_by is None
     print(f"\n5,000-question draw: {elapsed * 1000:.0f} ms")
     assert elapsed < 0.2, f"took {elapsed * 1000:.0f} ms"

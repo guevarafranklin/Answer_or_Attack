@@ -16,7 +16,7 @@ from app.models import GameSession, QuestionReport, User
 
 PLAYER_ROUTES = [
     ("/questions/{}/report", {"reason": "typo"}),
-    ("/sessions/generate", {"locale": "en"}),
+    ("/sessions", {"locale": "en"}),
 ]
 
 

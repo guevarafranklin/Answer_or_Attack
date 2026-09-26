@@ -180,3 +180,71 @@ def test_downgrade_and_upgrade_round_trip(migrated_db: str):
             )
         } - {"alembic_version"}
     assert restored == EXPECTED_TABLES
+
+
+def test_0005_backfills_pool_from_the_question_category(migrated_db: str):
+    """A Phase 1 row (drawn before session_questions.pool existed) reads as
+    a member of its question's category pool after 0005; the reserve
+    label and the check constraint are in place; the new sessions columns
+    take their defaults; downgrade drops them all cleanly. Runs against the alembic chain directly, so it uses
+    its own connection and cleans up after itself."""
+    import psycopg
+
+    from tests.conftest import TEST_URL
+
+    cfg = alembic_config()
+    sync_url = TEST_URL.set(drivername="postgresql").render_as_string(hide_password=False)
+    command.downgrade(cfg, "0004_sessions_and_reports")
+    try:
+        with psycopg.connect(sync_url, autocommit=True) as conn:
+            category_id = conn.execute(
+                "INSERT INTO categories (slug) VALUES ('m5') RETURNING id"
+            ).fetchone()[0]
+            question_id = conn.execute(
+                "INSERT INTO questions (category_id, difficulty, correct_index, content_hash) "
+                "VALUES (%s, 3, 0, 'm5-q') RETURNING id",
+                (category_id,),
+            ).fetchone()[0]
+            session_id = conn.execute(
+                "INSERT INTO sessions (join_code, locale, mode) VALUES ('M5CODE', 'en', 'house') "
+                "RETURNING id"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO session_questions (session_id, ordinal, question_id) VALUES (%s, 0, %s)",
+                (session_id, question_id),
+            )
+        command.upgrade(cfg, "0005_session_question_pools")
+        with psycopg.connect(sync_url, autocommit=True) as conn:
+            pool = conn.execute(
+                "SELECT pool FROM session_questions WHERE session_id = %s", (session_id,)
+            ).fetchone()[0]
+            assert pool == str(category_id)
+            # The lobby columns: overrides default to {}, the rest is NULL
+            # until start.
+            assert conn.execute(
+                "SELECT config_overrides, resolved_config, rng_seed FROM sessions WHERE id = %s",
+                (session_id,),
+            ).fetchone() == ({}, None, None)
+            conn.execute(
+                "INSERT INTO session_questions (session_id, ordinal, question_id, pool) "
+                "VALUES (%s, 1, %s, 'block')",
+                (session_id, question_id),
+            )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO session_questions (session_id, ordinal, question_id, pool) "
+                    "VALUES (%s, 2, %s, 'lobby')",
+                    (session_id, question_id),
+                )
+            with pytest.raises(psycopg.errors.NotNullViolation):
+                conn.execute(
+                    "INSERT INTO session_questions (session_id, ordinal, question_id) "
+                    "VALUES (%s, 3, %s)",
+                    (session_id, question_id),
+                )
+    finally:
+        with psycopg.connect(sync_url, autocommit=True) as conn:
+            conn.execute("DELETE FROM sessions")
+            conn.execute("DELETE FROM questions")
+            conn.execute("DELETE FROM categories")
+        command.upgrade(cfg, "head")
