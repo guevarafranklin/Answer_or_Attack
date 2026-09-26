@@ -258,6 +258,9 @@ CREATE TABLE question_reports (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX ON question_reports (question_id) WHERE resolved = FALSE;
+-- §4 "1 per user per question", enforced by the DB (migration 0004).
+CREATE UNIQUE INDEX question_reports_one_per_user_idx
+  ON question_reports (question_id, user_id) WHERE user_id IS NOT NULL;
 
 -- ---------- sessions (tables now, engine in Phase 2) ----------
 
@@ -294,6 +297,9 @@ CREATE TABLE session_questions (
   session_id  UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   ordinal     SMALLINT NOT NULL,
   question_id UUID NOT NULL REFERENCES questions(id),
+  -- Per-session shuffle: shown option i is the question's option option_order[i]
+  -- (migration 0004). An answer i is correct iff option_order[i] = questions.correct_index.
+  option_order SMALLINT[] NOT NULL DEFAULT '{0,1,2,3}',
   PRIMARY KEY (session_id, ordinal)
 );
 ```
@@ -311,6 +317,8 @@ CREATE TABLE session_questions (
 ## 4. API surface (Phase 1)
 
 All admin routes require `role='admin'`. Use a simple bearer-token dependency for now; real auth in Phase 4.
+
+Player routes (`/questions/{id}/report`, `/sessions/generate`) take the caller from an `X-User-Id` header naming a `users.id` (`app.auth.current_player`; 401 when missing, malformed or unknown). This identifies, it does not authenticate, so it is **dev-only**: it works when `ENV=dev` and is a 401 under the default `ENV=prod`, whatever the header says. It is the Phase 1 stand-in for the Phase 4 token, kept behind one dependency so the swap is one place.
 
 ### Categories
 ```
@@ -389,8 +397,10 @@ Interpretation for the UI copy: a **suspect** question usually has a wrong answe
 ```
 POST /sessions/generate
   {category_ids:[], locale, region, question_count, difficulty_curve:'ramp'|'flat', mode, pack_id?}
-  → {session_id, questions:[{id, stem, options, correct_index, ordinal}, ...]}
+  → 201 {session_id, questions:[{id, stem, options, ordinal}, ...], short_by?}
 ```
+
+The caller becomes the session host; the row is created as `status='lobby'` with `started_at` NULL — Phase 2 owns the lobby → running transition. The response carries the shuffled options and **no `correct_index`** — the server scores answers. `pack_id` is required in study mode and rejected in house mode (422).
 
 Behaviour:
 - Draw the **entire set at session start**, persist to `session_questions`, and cache the payload in Redis at `session:{id}:questions` with a 2-hour TTL. No per-round DB queries.
@@ -399,13 +409,14 @@ Behaviour:
 - `difficulty_curve='ramp'` → roughly 30% difficulty 1–2, 45% difficulty 3, 25% difficulty 4–5, ordered easy→hard.
 - Guarantee no duplicate `question_id` within a session.
 - If the pool is too small to fill the request, return what exists plus `{"short_by": n}` rather than repeating questions or erroring.
-- Shuffle option order per session and store the permutation with the session, so `correct_index` stays meaningful server-side.
+- Shuffle option order per session and store the permutation with the session, so `correct_index` stays meaningful server-side: `session_questions.option_order` (shown option i = original option `option_order[i]`), and the Redis payload — `{session_id, locale, questions:[{id, stem, options, ordinal, correct_index}]}` with `correct_index` already shifted to the shuffled position. Both suffice to score an answer; the DB rows are the source of truth, the cache is an optimisation (a Redis failure is logged, the session is still created).
+- The ramp draws its three bands separately (`round(0.30n)`, `round(0.25n)`, the rest for difficulty 3), tops up from any difficulty when a band is thin, and orders easy → hard; `flat` is one random draw in random order. Each draw excludes what earlier draws took, which is what guarantees no duplicate ids. Only questions with a translation in the requested locale are eligible.
 
 ### Player reports
 ```
 POST /questions/{id}/report   {reason, note?, session_id?}
 ```
-Rate-limit to 1 per user per question. Increments `question_stats.reports`.
+Rate-limit to 1 per user per question (`question_reports_one_per_user_idx`; a repeat is a 409). Increments `question_stats.reports` directly — no rollup in between — creating the stats row if the question has never been served, so the suspect view sees the report on its next request. 201 with the report row; unknown question 404.
 
 ---
 

@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from app import db
 from app.auth import verify_admin_user
 from app.config import settings
-from app.routers import categories, generation, health, questions
+from app.routers import categories, generation, health, questions, reports, sessions
 
 
 @asynccontextmanager
@@ -24,6 +24,8 @@ app.include_router(categories.router)
 app.include_router(generation.router)
 app.include_router(questions.router)
 app.include_router(health.router)
+app.include_router(reports.router)
+app.include_router(sessions.router)
 
 
 @app.get("/health")

@@ -1,18 +1,29 @@
-"""Admin auth (spec §4): a single shared bearer token until Phase 4.
+"""Auth (spec §4), both halves stubbed until Phase 4.
 
-Attach `Depends(require_admin)` to every /admin/* router. The token is read
-from settings at request time so tests can swap it without re-importing.
+Admin: a single shared bearer token. Attach `Depends(require_admin)` to
+every /admin/* router. The token is read from settings at request time so
+tests can swap it without re-importing.
+
+Player: `Depends(current_player)` resolves an `X-User-Id` header to a
+`users` row. This identifies, it does not authenticate — anyone who knows
+a user id can act as that player — so it only works when `ENV=dev`; under
+the default `ENV=prod` every player route is a 401 until Phase 4 puts real
+tokens behind this same dependency. The header name is a constant so the
+swap is one place.
 """
 import secrets
+import uuid
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.db import get_db
 from app.models import User
 
 _bearer = HTTPBearer(auto_error=False)
+PLAYER_HEADER = "X-User-Id"
 
 
 async def verify_admin_user(db: AsyncSession) -> None:
@@ -44,3 +55,27 @@ def require_admin(
         raise unauthorized
     if creds is None or not secrets.compare_digest(creds.credentials, expected):
         raise unauthorized
+
+
+async def current_player(
+    user_id: str | None = Header(default=None, alias=PLAYER_HEADER),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """The player making the request (see module docstring: a dev-only stub)."""
+    if settings.env != "dev":
+        # Fail closed: the header stub must never identify anyone in prod.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, detail="player auth is not available"
+        )
+    unauthorized = HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        detail=f"{PLAYER_HEADER} header with a known user id required",
+    )
+    try:
+        parsed = uuid.UUID(user_id or "")
+    except ValueError:
+        raise unauthorized from None
+    user = await db.get(User, parsed)
+    if user is None:
+        raise unauthorized
+    return user

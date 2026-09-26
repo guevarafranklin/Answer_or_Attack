@@ -28,13 +28,29 @@ class SessionGenerateRequest(BaseModel):
 
 
 class SessionQuestionOut(BaseModel):
-    """One drawn question, options already shuffled server-side."""
+    """One drawn question as the client sees it: options already shuffled
+    for this session, and no `correct_index` — the server scores answers."""
 
     id: uuid.UUID
     stem: str
     options: list[str] = Field(min_length=4, max_length=4)
-    correct_index: int = Field(ge=0, le=3)
     ordinal: int
+
+
+class SessionQuestionServer(SessionQuestionOut):
+    """The server's copy of the same (Redis `session:{id}:questions`):
+    `correct_index` is the position in the *shuffled* options."""
+
+    correct_index: int = Field(ge=0, le=3)
+
+
+class SessionQuestionsCache(BaseModel):
+    """Payload cached at session:{id}:questions for 2 hours (spec §4), so
+    Phase 2 scores a round without a DB query."""
+
+    session_id: uuid.UUID
+    locale: Locale
+    questions: list[SessionQuestionServer]
 
 
 class SessionGenerateResponse(BaseModel):

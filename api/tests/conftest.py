@@ -75,8 +75,11 @@ async def db(migrated_db: str):
 async def client(db: AsyncSession, monkeypatch: pytest.MonkeyPatch):
     """httpx client speaking ASGI to the app, with `get_db` overridden to the
     test session so route handlers write into the same rolled-back
-    transaction the test reads from. The admin token is set to ADMIN_TOKEN."""
+    transaction the test reads from. The admin token is set to ADMIN_TOKEN
+    and ENV to dev so the X-User-Id player stub works; a test that wants
+    prod behaviour monkeypatches `settings.env` back."""
     monkeypatch.setattr(settings, "admin_token", ADMIN_TOKEN)
+    monkeypatch.setattr(settings, "env", "dev")
 
     async def _override_get_db():
         yield db

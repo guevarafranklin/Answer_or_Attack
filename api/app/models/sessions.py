@@ -91,6 +91,12 @@ class SessionQuestion(Base):
     )
     ordinal: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
     question_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("questions.id"))
+    # Per-session shuffle: shown option i is the question's option
+    # option_order[i], so an answer i is correct iff
+    # option_order[i] == question.correct_index (migration 0004).
+    option_order: Mapped[list[int]] = mapped_column(
+        ARRAY(SmallInteger), server_default=text("'{0,1,2,3}'")
+    )
 
     session: Mapped[GameSession] = relationship(back_populates="questions")
     question: Mapped[Question] = relationship()

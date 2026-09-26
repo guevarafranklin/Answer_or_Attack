@@ -105,3 +105,11 @@ Index(
     QuestionReport.question_id,
     postgresql_where=QuestionReport.resolved == false(),
 )
+# §4: one report per user per question, enforced by the DB (migration 0004).
+Index(
+    "question_reports_one_per_user_idx",
+    QuestionReport.question_id,
+    QuestionReport.user_id,
+    unique=True,
+    postgresql_where=QuestionReport.user_id.is_not(None),
+)

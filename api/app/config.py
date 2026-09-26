@@ -1,9 +1,13 @@
 import uuid
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Defaults to prod so anything dev-only (the X-User-Id player stub,
+    # app.auth.current_player) is off unless a deployment opts in.
+    env: Literal["dev", "prod"] = "prod"
     database_url: str
     redis_url: str = "redis://localhost:6379/0"
     anthropic_api_key: str = ""
