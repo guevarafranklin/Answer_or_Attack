@@ -86,7 +86,14 @@ class GameSession(Base):
 
 
 class SessionPlayer(Base):
+    """A seat: created by POST /sessions/{join_code}/join, keyed by user.
+    `token_hash` is the sha256 of the player's session-scoped WebSocket
+    credential (migration 0006); the token itself is never stored."""
+
     __tablename__ = "session_players"
+    __table_args__ = (
+        Index("session_players_token_hash_idx", "session_id", "token_hash", unique=True),
+    )
 
     session_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True
@@ -95,9 +102,12 @@ class SessionPlayer(Base):
         Uuid, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     display_name: Mapped[str] = mapped_column(Text)
-    # 10 | 18 | 30, secret until reveal. Never serialized to clients before
-    # the reveal: app.schemas.sessions deliberately has no such field (§3.1).
-    starting_xp: Mapped[int] = mapped_column(SmallInteger)
+    token_hash: Mapped[str] = mapped_column(Text)
+    # Secret until the END reveal: drawn by the engine at Start, written
+    # back here with final_xp/delta_xp only when the game ends (§6). Never
+    # serialized to clients before then: app.schemas.sessions deliberately
+    # has no such field (§3.1).
+    starting_xp: Mapped[int | None] = mapped_column(SmallInteger)
     final_xp: Mapped[int | None] = mapped_column(SmallInteger)
     delta_xp: Mapped[int | None] = mapped_column(SmallInteger)
     joined_at: Mapped[TimestampNow]

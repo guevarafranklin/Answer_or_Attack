@@ -22,6 +22,8 @@ from app.schemas.generation import (
     GenerationStats,
 )
 from app.schemas.sessions import (
+    JoinRequest,
+    JoinResponse,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionPlayerRead,
@@ -37,6 +39,8 @@ from app.schemas.telemetry import (
 from app.schemas.users import SubscriptionRead, TicketLedgerEntryRead, UserRead
 
 __all__ = [
+    "JoinRequest",
+    "JoinResponse",
     "ORMModel",
     "CategoryCreate",
     "CategoryRead",

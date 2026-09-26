@@ -5,7 +5,8 @@ from fastapi import FastAPI
 from app import db
 from app.auth import verify_admin_user
 from app.config import settings
-from app.routers import categories, generation, health, questions, reports, sessions
+from app.game import runtime
+from app.routers import categories, generation, health, questions, reports, sessions, ws
 
 
 @asynccontextmanager
@@ -17,6 +18,7 @@ async def lifespan(_: FastAPI):
         async with db.SessionLocal() as session:
             await verify_admin_user(session)
     yield
+    await runtime.registry.shutdown()
 
 
 app = FastAPI(title="Answer or Attack — Content API", lifespan=lifespan)
@@ -26,6 +28,7 @@ app.include_router(questions.router)
 app.include_router(health.router)
 app.include_router(reports.router)
 app.include_router(sessions.router)
+app.include_router(ws.router)
 
 
 @app.get("/health")

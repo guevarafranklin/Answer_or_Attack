@@ -137,7 +137,7 @@ All messages are JSON `{ "type": ..., ... }`. Server times are epoch millisecond
 
 ### Join / session lifecycle
 - `POST /sessions` (HTTP) — host creates a lobby with config overrides and category ids → `{session_id, join_code}`. Draw happens at start, not here.
-- `POST /sessions/{join_code}/join` (HTTP) `{display_name}` → `{player_id, player_token}`.
+- `POST /sessions/{join_code}/join` (HTTP) `{display_name, player_token?}` → `{player_id, player_token}`. The token is opaque, random, stored hashed and scoped to the session. Once the game is running the endpoint only accepts a rejoin — the seat's own token — and refuses everyone else (409).
 - WS connect: `/ws/sessions/{join_code}?token=<player_token>`.
 
 ### Client → server
@@ -149,7 +149,7 @@ All messages are JSON `{ "type": ..., ... }`. Server times are epoch millisecond
 | `answer` | `question_id`, `option` (0–3) | QUESTION or BLOCK |
 | `attack` | `target_player_id` | ATTACK, token holders |
 | `pass` | | ATTACK, token holders who decline to attack |
-| `report` | `question_id`, `reason` | anytime after the question is shown |
+| `report` | `question_id`, `reason`, `note?` | anytime after the question is shown to you; filed through the report service |
 
 ### Server → client
 | type | notes |
@@ -160,6 +160,7 @@ All messages are JSON `{ "type": ..., ... }`. Server times are epoch millisecond
 | `board` | categories offered + picker id (PICK) |
 | `question` | `{question_id, stem, options, deadline_ms}` — **no correct_index** |
 | `answer_ack` | your answer was received in time / too late |
+| `report_ack` | your report was filed, or why not (`unknown_question`, `already_reported`) |
 | `reveal` | `correct_option`, your `outcome`, your nominal `delta`, everyone's nominal deltas, tokens you hold |
 | `attacks` | who attacked whom this window (no XP values) |
 | `block_question` | only to attacked players |

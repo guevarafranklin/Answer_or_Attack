@@ -35,6 +35,23 @@ class SessionCreateResponse(BaseModel):
     join_code: str
 
 
+class JoinRequest(BaseModel):
+    """POST /sessions/{join_code}/join. `player_token` is only needed to
+    rejoin a running game (app.services.players)."""
+
+    display_name: str = Field(min_length=1, max_length=40)
+    player_token: str | None = Field(default=None, max_length=128)
+
+
+class JoinResponse(BaseModel):
+    """`player_id` is the id used in every protocol message; `player_token`
+    opens the WebSocket (`/ws/sessions/{join_code}?token=`) and is the
+    rejoin credential — shown once, never stored in clear."""
+
+    player_id: str
+    player_token: str
+
+
 class SessionQuestionOut(BaseModel):
     """One drawn question as the client sees it: options already shuffled
     for this session, and no `correct_index` — the server scores answers."""

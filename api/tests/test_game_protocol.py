@@ -841,7 +841,8 @@ def test_client_messages_parse_from_dicts_and_json(raw, cls):
         {"type": "answer", "question_id": "g-1"},
         {"type": "pass", "player_id": "a"},  # the sender is the socket, never a field
         {"type": "pick"},
-        {"type": "report", "question_id": "g-1", "reason": ""},
+        {"type": "report", "question_id": "g-1", "reason": "bogus"},
+        {"type": "report", "question_id": "g-1", "reason": "typo", "note": "x" * 1001},
         "not json",
     ],
 )
@@ -860,7 +861,7 @@ def test_to_event_maps_game_messages_and_skips_the_rest():
     assert proto.to_event(proto.AttackIn(type="attack", target_player_id="b"), pid) == Attack(pid, "b")
     assert proto.to_event(proto.PassIn(type="pass"), pid) == Pass(pid)
     assert proto.to_event(proto.SyncIn(type="sync", client_ms=1), pid) is None
-    assert proto.to_event(proto.ReportIn(type="report", question_id="x", reason="r"), pid) is None
+    assert proto.to_event(proto.ReportIn(type="report", question_id="x", reason="typo"), pid) is None
 
 
 # ---------- glue ----------
@@ -907,4 +908,5 @@ def test_every_server_message_type_is_distinct_and_matches_the_spec():
     assert types == {
         "sync_reply", "lobby", "phase", "board", "question", "answer_ack", "pass_ack", "reveal",
         "attacks", "block_question", "block_result", "presence", "end", "error", "state",
+        "report_ack",
     }

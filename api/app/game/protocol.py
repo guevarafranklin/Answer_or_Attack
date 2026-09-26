@@ -47,6 +47,7 @@ from app.game import engine as eng
 from app.game.config import GameConfig
 from app.game.engine import GameState, Phase
 from app.rules import OPTION_COUNT
+from app.schemas.common import ReportReason
 from app.schemas.sessions import SessionQuestionsCache
 
 Option = Annotated[int, Field(ge=0, le=OPTION_COUNT - 1)]
@@ -111,9 +112,13 @@ class PassIn(_Strict):
 
 
 class ReportIn(_Strict):
+    """Same shape as POST /questions/{id}/report; the runtime files it
+    through the report service, for a question this player has been shown."""
+
     type: Literal["report"]
     question_id: str
-    reason: str = Field(min_length=1, max_length=500)
+    reason: ReportReason
+    note: str | None = Field(default=None, max_length=1000)
 
 
 ClientMessage = Annotated[
@@ -213,6 +218,16 @@ class PassAckOut(_Strict):
     """To the passer only."""
 
     type: Literal["pass_ack"] = "pass_ack"
+
+
+class ReportAckOut(_Strict):
+    """To the reporter only: filed, or why not (`unknown_question`,
+    `already_reported`, `failed`)."""
+
+    type: Literal["report_ack"] = "report_ack"
+    question_id: str
+    accepted: bool
+    reason: str | None = None
 
 
 class RevealOut(_Strict):
@@ -335,6 +350,7 @@ ServerMessage = (
     | QuestionOut
     | AnswerAckOut
     | PassAckOut
+    | ReportAckOut
     | RevealOut
     | AttacksOut
     | BlockQuestionOut
