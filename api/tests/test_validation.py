@@ -154,6 +154,43 @@ def test_forbidden_phrase(locale, where, value):
     assert reasons(item(**{f"{locale}.{where}": value})) == [f"forbidden_phrase:{locale}"]
 
 
+@pytest.mark.parametrize(
+    "locale, stem",
+    [
+        ("en", "Is 4 the answer to 2 + 2?"),  # whole answer as a word
+        ("es", "¿Es 4 la respuesta a 2 + 2?"),
+    ],
+)
+def test_answer_in_stem(locale, stem):
+    assert reasons(item(**{f"{locale}.stem": stem})) == [f"answer_in_stem:{locale}"]
+
+
+def test_answer_in_stem_checks_the_correct_option_only():
+    """"22" is a distractor here; only the correct option is a giveaway."""
+    assert isinstance(validate_item(item(**{"en.stem": "Is 22 what 2 + 2 makes?"})), CleanItem)
+    assert reasons(item(correct_index=3, **{"en.stem": "Is 22 what 2 + 2 makes?"})) == [
+        "answer_in_stem:en"
+    ]
+
+
+def test_answer_in_stem_is_reported_per_locale_with_distinctive_words():
+    raw = item(
+        **{
+            "en.stem": "Which sculptor carved David?",
+            "en.options": ["Donatello", "Bernini", "Michelangelo", "Cellini"],
+            "es.stem": "¿Qué escultor, Miguel Angel, talló el David?",  # accent-insensitive
+            "es.options": ["Donatello", "Bernini", "Miguel Ángel", "Cellini"],
+        }
+    )
+    assert reasons(raw) == ["answer_in_stem:es"]
+
+
+def test_answer_in_stem_not_checked_when_correct_index_is_invalid():
+    assert reasons(item(correct_index=9, **{"en.stem": "Is 4 the answer?"})) == [
+        v.CORRECT_INDEX_INVALID
+    ]
+
+
 @pytest.mark.parametrize("value", [-1, 4, "2", 2.0, True, None, MISSING])
 def test_correct_index_invalid(value):
     assert reasons(item(correct_index=value)) == [v.CORRECT_INDEX_INVALID]

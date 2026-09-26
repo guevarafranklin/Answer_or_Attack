@@ -22,11 +22,22 @@ from app.schemas.content import (
     QuestionTranslationIn,
     QuestionUpdate,
 )
+from app.rules import RuleViolation, validate_answer_not_in_stem
 from app.services.validation import content_hash
 
 
 class QuestionError(Exception):
     """A review action that cannot be applied to this question."""
+
+
+class InvalidEdit(QuestionError):
+    """The edited question breaks an app.rules rule that needs the whole
+    question to check (the schema already covered per-locale text)."""
+
+    def __init__(self, code: str, locale: str, message: str) -> None:
+        super().__init__(f"{message} ({code}:{locale})")
+        self.code = code
+        self.locale = locale
 
 
 class DuplicateQuestion(QuestionError):
@@ -62,6 +73,10 @@ async def list_questions(
     where = [Question.pack_id.is_(None)]
     if query.status is not None:
         where.append(Question.status == query.status)
+    if query.difficulty is not None:
+        where.append(Question.difficulty == query.difficulty)
+    if query.job_id is not None:
+        where.append(Question.generation_job_id == query.job_id)
     if query.category is not None:
         category_id = select(Category.id).where(Category.slug == query.category)
         where.append(Question.category_id == category_id.scalar_subquery())
@@ -87,10 +102,12 @@ async def list_questions(
 async def update_question(db: AsyncSession, question: Question, data: QuestionUpdate) -> Question:
     """Apply only the fields the client sent. Translations are merged per
     locale: a locale that is sent is replaced, one that is omitted is kept.
-    Text limits were already enforced by the schema (app.rules). Changing
-    the en stem re-derives content_hash; a collision with another house
-    question raises DuplicateQuestion after rolling back to the pre-call
-    state (a savepoint), so the caller's transaction stays usable."""
+    Per-locale text limits were already enforced by the schema (app.rules);
+    the answer-in-stem rule needs correct_index too, so it is checked here
+    on the merged result and raises InvalidEdit. Changing the en stem
+    re-derives content_hash; a collision with another house question raises
+    DuplicateQuestion. Either failure rolls back to the pre-call state (a
+    savepoint), so the caller's transaction stays usable."""
     fields = data.model_dump(exclude_unset=True)
     translations: dict[str, QuestionTranslationIn] = data.translations or {}
     try:
@@ -119,6 +136,11 @@ async def update_question(db: AsyncSession, question: Question, data: QuestionUp
                     )
             if "en" in translations:
                 question.content_hash = content_hash(translations["en"].stem)
+            for t in question.translations:
+                try:
+                    validate_answer_not_in_stem(t.stem, t.options[question.correct_index])
+                except RuleViolation as exc:
+                    raise InvalidEdit(exc.code, t.locale, str(exc)) from exc
     except IntegrityError as exc:
         if _constraint_name(exc) == "questions_house_hash_uniq":
             raise DuplicateQuestion() from exc

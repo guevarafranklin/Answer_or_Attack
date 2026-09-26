@@ -1,6 +1,6 @@
 """Spec §4 — Review queue:
 
-    GET    /admin/questions?status=pending&category=math&locale=en&page=1
+    GET    /admin/questions?status=pending&category=math&locale=en&difficulty=3&job_id=…&page=1
     GET    /admin/questions/{id}
     PATCH  /admin/questions/{id}        edit stem/options/correct_index/difficulty/region/tags
     POST   /admin/questions/{id}/approve     → status='live', stamps reviewed_by/at
@@ -67,6 +67,8 @@ async def update_question(
     question = await _load(db, question_id)
     try:
         question = await svc.update_question(db, question, payload)
+    except svc.InvalidEdit as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     except svc.DuplicateQuestion as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await db.commit()

@@ -156,11 +156,13 @@ class QuestionUpdate(BaseModel):
 
 
 class QuestionListQuery(BaseModel):
-    """GET /admin/questions?status=&category=&locale=&page="""
+    """GET /admin/questions?status=&category=&locale=&difficulty=&job_id=&page="""
 
     status: QuestionStatus | None = None
     category: str | None = None  # slug
     locale: Locale | None = None  # only questions that have text in this locale
+    difficulty: int | None = Field(default=None, ge=1, le=5)
+    job_id: uuid.UUID | None = None  # generation_job_id
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=200)
 

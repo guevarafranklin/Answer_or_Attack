@@ -342,7 +342,7 @@ GET    /admin/generate?limit=50     → recent jobs, newest first
 
 ### Review queue
 ```
-GET    /admin/questions?status=pending&category=math&locale=en&page=1
+GET    /admin/questions?status=pending&category=math&locale=en&difficulty=3&job_id=…&page=1
 GET    /admin/questions/{id}
 PATCH  /admin/questions/{id}        edit stem/options/correct_index/difficulty/region/tags
 POST   /admin/questions/{id}/approve     → status='live', stamps reviewed_by/at
@@ -351,8 +351,8 @@ POST   /admin/questions/{id}/archive     → status='archived'
 POST   /admin/questions/bulk             {ids:[], action:'approve'|'reject'|'archive'}
 ```
 
-- The list covers house content only (`pack_id IS NULL`), newest first, and returns `{items, page, page_size, total}` (`page_size` 1–200, default 50). `category` is a slug; `locale` keeps only questions that have text in that locale. Any question, pack or house, is still reachable by id.
-- `PATCH` merges per locale (a locale that is sent is replaced, one that is omitted is kept) and runs the text through the same `app/rules.py` limits the generator's validator uses — stem ≤120, exactly 4 distinct non-empty options ≤60, no "all/none of the above" — so a bad edit is a 422 and nothing is written. Editing the `en` stem re-derives `content_hash`; a collision with another house question is a 409.
+- The list covers house content only (`pack_id IS NULL`), newest first, and returns `{items, page, page_size, total}` (`page_size` 1–200, default 50). Filters combine with AND: `status`, `category` (slug), `locale` (only questions that have text in that locale), `difficulty` (1–5), `job_id` (`generation_job_id`, to review one batch). Any question, pack or house, is still reachable by id.
+- `PATCH` merges per locale (a locale that is sent is replaced, one that is omitted is kept) and runs the result through the same `app/rules.py` rules the generator's validator uses — stem ≤120, exactly 4 distinct non-empty options ≤60, no "all/none of the above", and no answer in the stem (checked on the merged question, so moving `correct_index` onto an option the stem contains fails too) — so a bad edit is a 422 and nothing is written. Editing the `en` stem re-derives `content_hash`; a collision with another house question is a 409.
 - `approve` refuses (409) a question that lacks either locale: the game serves both. `approve` and `reject` stamp `reviewed_at` and set `reviewed_by` to `ADMIN_USER_ID` (a `users.id`; unset leaves it NULL until Phase 4 auth identifies the reviewer). `archive` retires a question without touching the review stamp. Repeating an action a question is already in is a no-op, not a re-stamp.
 - `bulk` applies the action to each id independently and returns `{updated: [ids], failed: [{id, detail}]}` — an unknown id or an unapprovable question never blocks the rest.
 
@@ -429,6 +429,7 @@ The admin types natural language ("Create 100 math questions from first grade to
    - stem longer than 120 chars (unreadable in 10 seconds — this is a hard product constraint, not a style note)
    - any option longer than 60 chars
    - missing locale
+   - the stem gives the answer away (`answer_in_stem:<locale>`): the correct option appears in the stem as a whole phrase, or any distinctive word of it (≥4 letters, not a question/function word like "which", "city", "cuál") appears as a word, compared case- and accent-insensitively. Checked per locale against that locale's own correct option.
    - `content_hash` collides with existing house content
 5. Insert survivors as `status='pending'`, tagged with `generation_job_id`.
 6. Update counts, set the final status, record `cost_cents`, and write `stats`:

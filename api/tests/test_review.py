@@ -10,14 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.models import Category, Question, QuestionTranslation, User
+from app.models import Category, GenerationJob, Question, QuestionTranslation, User
 from app.rules import MAX_STEM_LEN
 from app.services.validation import content_hash
 
 # ---------- fixtures ----------
 
 ABCD = ["a", "b", "c", "d"]
-ES_EDIT = {"stem": "¿Cuánto es 1 + 1?", "options": ["2", "3", "4", "5"]}
+TWO_FIVE = ["2", "3", "4", "5"]
+ES_EDIT = {"stem": "¿Cuánto es 1 + 1?", "options": TWO_FIVE}
 
 
 async def _category(db: AsyncSession, slug: str = "math") -> Category:
@@ -118,13 +119,16 @@ async def test_list_defaults_to_house_questions_newest_first(
 
 
 @pytest.mark.asyncio
-async def test_list_filters_by_status_category_and_locale(
-    client: AsyncClient, admin_headers, db: AsyncSession
-):
+async def test_list_filters(client: AsyncClient, admin_headers, db: AsyncSession):
     math, bible = await _category(db, "math"), await _category(db, "bible")
-    pending_math = await _question(db, math, 1)
-    live_math = await _question(db, math, 2, status="live")
-    pending_bible = await _question(db, bible, 3)
+    job = GenerationJob(
+        kind="category", prompt="t", params={"category_slug": "math", "count": 1}, requested_count=1
+    )
+    db.add(job)
+    await db.flush()
+    pending_math = await _question(db, math, 1, generation_job_id=job.id)
+    live_math = await _question(db, math, 2, status="live", difficulty=4)
+    pending_bible = await _question(db, bible, 3, difficulty=4)
     en_only = await _question(db, math, 4, locales=("en",))
 
     async def ids(**params) -> set[str]:
@@ -141,7 +145,14 @@ async def test_list_filters_by_status_category_and_locale(
     assert await ids(locale="es") == {
         str(pending_math.id), str(live_math.id), str(pending_bible.id)
     }
+    assert await ids(difficulty=4) == {str(live_math.id), str(pending_bible.id)}
+    assert await ids(difficulty=4, status="pending") == {str(pending_bible.id)}
+    assert await ids(job_id=str(job.id)) == {str(pending_math.id)}
+    assert await ids(job_id=str(uuid.uuid4())) == set()
     assert await ids(status="pending", category="math", locale="es") == {str(pending_math.id)}
+    for bad in ({"difficulty": 0}, {"difficulty": 6}, {"job_id": "nope"}, {"locale": "fr"}):
+        resp = await client.get("/admin/questions", params=bad, headers=admin_headers)
+        assert resp.status_code == 422, bad
 
 
 @pytest.mark.asyncio
@@ -323,6 +334,38 @@ async def test_patch_rejects_rule_violations(
         "en": "Question 1: what is 1 + 1?",
         "es": "Pregunta 1: ¿cuánto es 1 + 1?",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload, locale",
+    [
+        # New stem gives the stored answer ("2") away.
+        ({"translations": {"en": {"stem": "Is 2 what 1 + 1 makes?", "options": TWO_FIVE}}}, "en"),
+        ({"translations": {"es": {"stem": "¿Es 2 lo que da 1 + 1?", "options": TWO_FIVE}}}, "es"),
+        # Only the answer key moves, onto an option the stored stem contains ("1").
+        ({"correct_index": 1}, "en"),
+    ],
+)
+async def test_patch_rejects_answer_in_stem_on_the_merged_question(
+    client: AsyncClient, admin_headers, db: AsyncSession, payload: dict, locale: str
+):
+    """The rule needs stem + options + correct_index together, so it runs on
+    the question as it would be after the edit, whichever part changed."""
+    cat = await _category(db)
+    q = await _question(db, cat, 1)
+    if "correct_index" in payload:
+        # en options ["2", "1", "4", "5"]: index 1 is "1", which the stem contains.
+        next(t for t in q.translations if t.locale == "en").options = ["2", "1", "4", "5"]
+        await db.flush()
+    q_id = q.id
+
+    resp = await client.patch(f"/admin/questions/{q_id}", json=payload, headers=admin_headers)
+    assert resp.status_code == 422, resp.text
+    assert f"answer_in_stem:{locale}" in resp.json()["detail"]
+    fresh = await _fresh(db, q_id)
+    assert fresh.correct_index == 0
+    assert {t.locale: t.stem for t in fresh.translations}["en"] == "Question 1: what is 1 + 1?"
 
 
 @pytest.mark.asyncio

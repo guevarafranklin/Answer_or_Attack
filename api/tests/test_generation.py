@@ -1,5 +1,6 @@
 """§9 step 4: POST/GET /admin/generate, the stub generator, and the worker
 job function (called directly — no Redis, no running worker)."""
+import math
 import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -223,9 +224,8 @@ async def test_stub_mixed_batch_hits_every_rejection_rule():
     """The mixed batch spans the first STUB_MIXED_COUNT items of the stream,
     however it is chunked."""
     p = GenerationParams(category_slug="math", count=STUB_MIXED_COUNT)
-    size = 10
     items: list = []
-    for chunk_index in range(STUB_MIXED_COUNT // size):
+    for chunk_index, size in enumerate(chunk_sizes(STUB_MIXED_COUNT, 10)):
         items += (await StubGenerator().generate(p, size, chunk_index)).items
     assert len(items) == STUB_MIXED_COUNT
 
@@ -246,7 +246,7 @@ async def test_stub_mixed_batch_hits_every_rejection_rule():
         "stem_empty", "stem_too_long", v.OPTIONS_INVALID, "options_count",
         "option_empty", "option_too_long", "options_duplicate", v.EXPLANATION_INVALID,
         v.FORBIDDEN_PHRASE, v.CORRECT_INDEX_INVALID, v.DIFFICULTY_INVALID,
-        v.GRADE_BAND_INVALID, v.TAGS_INVALID, v.DUPLICATE_IN_BATCH,
+        v.GRADE_BAND_INVALID, v.TAGS_INVALID, v.ANSWER_IN_STEM, v.DUPLICATE_IN_BATCH,
     }
     assert every_rule <= codes
 
@@ -256,7 +256,7 @@ async def test_stub_later_chunks_are_clean_and_respect_params():
     p = GenerationParams(
         category_slug="math", count=30, difficulty_min=2, difficulty_max=3, grade_bands=["g4_g6"]
     )
-    first_clean_chunk = STUB_MIXED_COUNT // 10
+    first_clean_chunk = math.ceil(STUB_MIXED_COUNT / 10)
     items = (await StubGenerator().generate(p, 10, first_clean_chunk)).items
     assert len(items) == 10
     for raw in items:
@@ -484,18 +484,19 @@ async def test_terminal_job_is_not_rerun(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_stub_end_to_end(db: AsyncSession):
-    """A stub job of 25 = the 20-item mixed batch (1 accepted) over two
-    chunks + one clean chunk of 5."""
+    """A stub job = the mixed batch (1 accepted) + 5 clean items, chunked
+    by 10, so the clean tail shares a chunk with the end of the batch."""
     await _category(db)
-    job = await _job(db, STUB_MIXED_COUNT + 5)
+    count = STUB_MIXED_COUNT + 5
+    job = await _job(db, count)
     job = await _run(db, job, StubGenerator())
 
     assert job.status == "partial"
     assert job.model == "stub"
-    assert (job.produced_count, job.accepted_count, job.rejected_count) == (25, 6, 19)
-    assert job.stats["chunks_total"] == 3
+    assert (job.produced_count, job.accepted_count, job.rejected_count) == (count, 6, count - 6)
+    assert job.stats["chunks_total"] == len(chunk_sizes(count, 10))
     assert job.stats["repeated"] == 1
-    assert len(job.stats["rejections"]) >= 18
+    assert len(job.stats["rejections"]) >= 19
     rows = await _questions_for(db, job)
     assert len(rows) == 6
 

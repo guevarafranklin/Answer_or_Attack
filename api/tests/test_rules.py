@@ -3,7 +3,15 @@ schema must enforce exactly those values."""
 import pytest
 from pydantic import ValidationError
 
-from app.rules import MAX_OPTION_LEN, MAX_STEM_LEN, OPTION_COUNT, validate_options, validate_stem
+from app.rules import (
+    MAX_OPTION_LEN,
+    MAX_STEM_LEN,
+    OPTION_COUNT,
+    RuleViolation,
+    validate_answer_not_in_stem,
+    validate_options,
+    validate_stem,
+)
 from app.schemas.content import QuestionTranslationIn
 
 GOOD_OPTIONS = ["a", "b", "c", "d"]
@@ -48,3 +56,49 @@ def test_schema_uses_the_rules():
         QuestionTranslationIn(**_translation(options=["a", "b", "c"]))
     with pytest.raises(ValidationError):
         QuestionTranslationIn(**_translation(options=["a", "b", "c", "a"]))
+
+
+# ---------- answer in stem (§5.3) ----------
+
+
+@pytest.mark.parametrize(
+    "stem, answer",
+    [
+        ("Who painted the Mona Lisa in Florence?", "Leonardo da Vinci"),
+        ("In what year did the Byzantine Empire fall?", "1453"),
+        ("Which city is the capital of Australia?", "Canberra"),
+        ("¿Quién fundó el Imperio mongol?", "Gengis Kan"),
+        ("Which planet is the Red Planet?", "Mars"),  # short but a whole-word match
+        ("Which of these is a star?", "Sun"),  # 3 letters, still the whole answer
+        ("What is 2 + 2?", "4"),
+    ],
+)
+def test_answer_not_in_stem_accepts(stem, answer):
+    validate_answer_not_in_stem(stem, answer)
+
+
+@pytest.mark.parametrize(
+    "stem, answer",
+    [
+        ("Who painted the Mona Lisa, Leonardo's masterpiece?", "Leonardo da Vinci"),
+        ("Which empire, the Byzantine one, fell in 1453?", "Byzantine Empire"),  # one word
+        ("Which city, Canberra, is Australia's capital?", "Canberra"),
+        ("Which battle ended in 1453?", "1453"),  # whole answer as a word
+        ("¿Qué conquistador, Gengis Kan, unificó Mongolia?", "Gengis Kan"),
+        ("¿Quién fue GENGIS KAN?", "Gengis Kan"),  # case-insensitive
+        ("¿Qué país tiene Mexico como capital?", "México"),  # accent-insensitive
+        ("Which star is the Sun?", "Sun"),  # whole answer, even under 4 letters
+    ],
+)
+def test_answer_not_in_stem_rejects(stem, answer):
+    with pytest.raises(RuleViolation) as info:
+        validate_answer_not_in_stem(stem, answer)
+    assert info.value.code == "answer_in_stem"
+
+
+def test_answer_not_in_stem_ignores_function_and_question_words():
+    """Sharing "which"/"city"/"year" with the stem is not a giveaway."""
+    validate_answer_not_in_stem("Which city hosted the 2000 Olympics?", "Mexico City")
+    validate_answer_not_in_stem("Which river is the longest in Africa?", "Nile River")
+    validate_answer_not_in_stem("¿Qué ciudad es la capital de Perú?", "Ciudad de Lima")
+    validate_answer_not_in_stem("What is 2 + 2?", "")  # nothing to compare
