@@ -151,7 +151,8 @@ CREATE TABLE generation_jobs (
   accepted_count  INT NOT NULL DEFAULT 0,      -- survived validation, written as pending
   rejected_count  INT NOT NULL DEFAULT 0,      -- failed validation or deduped
   cost_cents      INT,
-  error           TEXT,
+  error           TEXT,                        -- human-readable summary: top rejection reasons, chunk failures
+  stats           JSONB NOT NULL DEFAULT '{}', -- structured diagnostics, see §5.2 step 6 (migration 0002)
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   started_at      TIMESTAMPTZ,
   finished_at     TIMESTAMPTZ
@@ -306,12 +307,37 @@ PATCH  /admin/categories/{id}
 
 ### Generation
 ```
-POST   /admin/generate              → 202 {job_id}
-GET    /admin/generate/{job_id}     → job status + counts
-GET    /admin/generate              → recent jobs
+POST   /admin/generate              {prompt, params, kind?}   → 202 {job_id}
+GET    /admin/generate/{job_id}     → job status + counts + stats
+GET    /admin/generate?limit=50     → recent jobs, newest first
 ```
 
-`POST /admin/generate` **queues an arq job and returns immediately.** It does not wait for the model. The admin chat panel polls the job endpoint.
+`POST /admin/generate` body:
+
+```json
+{
+  "prompt": "Create 100 math questions from first grade to high school",
+  "params": { ...§5.1 object... },
+  "kind": "category"
+}
+```
+
+- `prompt` is the admin's original free text, stored on the job for the record only.
+- `params` is the structured §5.1 object the admin confirmed. It is validated before anything is queued: `category_slug` must exist (else 422), `count` is 1–200.
+- `kind` defaults to `'category'`.
+
+`POST /admin/generate` **queues an arq job and returns immediately.** It does not wait for the model. The admin chat panel polls the job endpoint. A bad count or an unknown category fails before the row is written; if Redis is unreachable after the row is written the job is stored as `failed` and the request returns 503.
+
+`GET /admin/generate/{job_id}` returns the row's columns plus `stats` (see §5.2 step 6):
+
+```json
+{
+  "rejections":   {"stem_too_long:es": 3, "duplicate_in_batch": 1},
+  "emitted": 20, "repeated": 1, "repeat_rate": 0.05,
+  "chunks_total": 5, "chunks_failed": 1,
+  "chunk_errors": ["chunk 3: RuntimeError: ..."]
+}
+```
 
 ### Review queue
 ```
@@ -399,9 +425,12 @@ The admin types natural language ("Create 100 math questions from first grade to
    - missing locale
    - `content_hash` collides with existing house content
 5. Insert survivors as `status='pending'`, tagged with `generation_job_id`.
-6. Update counts, set `succeeded` / `partial` / `failed`, record `cost_cents`.
+6. Update counts, set the final status, record `cost_cents`, and write `stats`:
+   - `succeeded` if every produced item was accepted; `partial` if any item was rejected or any chunk failed; `failed` if nothing was accepted.
+   - `stats` (JSONB): `rejections` (reason code → count, one count per code per item, so a multi-fault item appears under each of its codes), `emitted` / `repeated` / `repeat_rate` (how often the generator repeated an `en` stem across the whole job, counted on every emission whether or not it was accepted), `chunks_total`, `chunks_failed`, `chunk_errors`.
+   - `error` is the human-readable summary of the same: top rejection reasons with counts, repeat rate, chunk failures. `NULL` when the job was clean.
 
-Rejected items are counted, not stored. Log a sample to the job's `error` field when `rejected_count` is high — that is how you notice a bad prompt.
+Rejected items are counted, not stored. Rejection reason codes are stable strings (`stem_too_long:es`, `correct_index_invalid`, `duplicate_in_batch`, …) so the admin UI can group on them — that is how you notice a bad prompt.
 
 ### 5.3 Prompt guidance for the generator
 
