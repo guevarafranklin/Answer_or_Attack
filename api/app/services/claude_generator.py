@@ -34,10 +34,9 @@ from app.services.generator import GeneratedChunk, GeneratorError, Usage
 
 log = logging.getLogger(__name__)
 
-# Generous ceiling for 20 bilingual items with explanations; a truncated
-# response shows up as stop_reason="max_tokens" and fails the chunk.
-MAX_TOKENS_PER_ITEM = 600
-MAX_TOKENS_BASE = 500
+# Explanations are the biggest source of output tokens and only need to be
+# short; a prompt-side cap, not a validator rule.
+MAX_EXPLANATION_LEN = 200
 REQUEST_TIMEOUT_SECONDS = 180.0
 RETRY_DELAY_SECONDS = 5.0
 RETRY_DELAY_CAP_SECONDS = 60.0
@@ -58,6 +57,7 @@ Hard rules — a question that breaks any of these is thrown away:
 - Exactly one defensible correct answer. Ambiguity is the main failure mode in trivia; if two options could be argued correct, pick a different question.
 - Exactly {OPTION_COUNT} options, all distinct, each at most {MAX_OPTION_LEN} characters.
 - Stem at most {MAX_STEM_LEN} characters.
+- explanation: one sentence, at most {MAX_EXPLANATION_LEN} characters, in each locale. Say why the answer is right; nothing more.
 - Distractors must be plausible and the same category of thing as the answer: all years, all names, all numbers.
 - Never use {", ".join(f'"{p}"' for p in FORBIDDEN_PHRASES)} or anything like them.
 - No questions whose answer changes over time ("the current president") unless the question's tags include "time_sensitive".
@@ -166,6 +166,7 @@ class ClaudeGenerator:
         price_input_per_mtok: float,
         price_output_per_mtok: float,
         structured_output: bool = True,
+        max_tokens: int | None = None,
         retry_delay: float = RETRY_DELAY_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
@@ -174,6 +175,7 @@ class ClaudeGenerator:
         self._price_in = price_input_per_mtok
         self._price_out = price_output_per_mtok
         self._structured_output = structured_output
+        self._max_tokens = max_tokens or settings.generator_max_tokens
         self._retry_delay = retry_delay
         self._sleep = sleep
 
@@ -192,6 +194,7 @@ class ClaudeGenerator:
             price_input_per_mtok=settings.generator_price_input_per_mtok,
             price_output_per_mtok=settings.generator_price_output_per_mtok,
             structured_output=settings.generator_structured_output,
+            max_tokens=settings.generator_max_tokens,
         )
 
     async def generate(
@@ -201,14 +204,14 @@ class ClaudeGenerator:
         chunk_index: int,
         avoid: Sequence[str] = (),
     ) -> GeneratedChunk:
-        message = await self._call(build_user_prompt(params, count, avoid), count)
+        message = await self._call(build_user_prompt(params, count, avoid))
         usage = self._usage_of(message)
         return GeneratedChunk(self._parse(message, usage), usage)
 
-    async def _call(self, user_prompt: str, count: int) -> Message:
+    async def _call(self, user_prompt: str) -> Message:
         request: dict[str, Any] = {
             "model": self.name,
-            "max_tokens": MAX_TOKENS_BASE + MAX_TOKENS_PER_ITEM * count,
+            "max_tokens": self._max_tokens,
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": user_prompt}],
         }
@@ -233,14 +236,16 @@ class ClaudeGenerator:
 
     @staticmethod
     def _parse(message: Message, usage: Usage) -> list[Any]:
+        # stop_reason is in every message so a truncation (max_tokens) is
+        # identifiable at a glance in stats.chunk_errors.
+        stop = f"stop_reason={message.stop_reason}"
         text = "".join(block.text for block in message.content if block.type == "text")
         if not text:
-            raise GeneratorError(f"no text in response (stop_reason={message.stop_reason})", usage)
+            raise GeneratorError(f"no text in response ({stop})", usage)
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            why = "response truncated at max_tokens" if message.stop_reason == "max_tokens" else str(exc)
-            raise GeneratorError(f"malformed JSON: {why}", usage) from exc
+            raise GeneratorError(f"malformed JSON ({stop}): {exc}", usage) from exc
         if not isinstance(data, dict) or not isinstance(data.get("questions"), list):
-            raise GeneratorError('malformed JSON: expected {"questions": [...]}', usage)
+            raise GeneratorError(f'malformed JSON ({stop}): expected {{"questions": [...]}}', usage)
         return data["questions"]

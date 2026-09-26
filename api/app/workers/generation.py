@@ -1,7 +1,7 @@
 """The generation job (spec §5.2 worker flow).
 
     1. mark running
-    2. chunks of 20 — never one big call
+    2. chunks of settings.generator_chunk_size — never one big call
     3. generator produces raw items for a chunk
     4. validate + dedupe every item
     5. insert survivors as status='pending', source='ai', generation_job_id set
@@ -22,6 +22,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Category, GenerationJob, Question, QuestionTranslation
 from app.schemas.generation import GenerationParams, GenerationStats
 from app.services.categories import get_category_by_slug
@@ -38,15 +39,15 @@ from app.services.validation import (
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 20
 TOP_REASONS_IN_ERROR = 5
 TERMINAL_STATUSES = frozenset({"succeeded", "partial", "failed"})
 
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
-def chunk_sizes(count: int, size: int = CHUNK_SIZE) -> list[int]:
-    """[20, 20, 5] for count=45."""
+def chunk_sizes(count: int, size: int | None = None) -> list[int]:
+    """[10, 10, 5] for count=25 at the default chunk size."""
+    size = size or settings.generator_chunk_size
     full, rest = divmod(count, size)
     return [size] * full + ([rest] if rest else [])
 

@@ -170,14 +170,25 @@ def _bad_items(params: GenerationParams) -> list[Any]:
     return items
 
 
-class StubGenerator:
-    """Fixed items, no network. Chunk 0 is a deliberately mixed batch that
-    fits in one 20-item chunk — one good item, a duplicate of it, and one bad
-    item per rejection rule — so a stub job exercises every path in the
-    worker. Later chunks are all good and unique.
+def _mixed_items(params: GenerationParams) -> list[Any]:
+    """The stub's opening batch: one good item, a duplicate of it, and one
+    bad item per rejection rule."""
+    first = _good(0, params)
+    return [first, copy.deepcopy(first), *_bad_items(params)]  # second is duplicate_in_batch
 
-    Stems are numbered per chunk, so runs are deterministic and dedupe only
-    fires where intended.
+
+#: Length of the stub's mixed opening batch (see StubGenerator).
+STUB_MIXED_COUNT = len(_mixed_items(GenerationParams(category_slug="_", count=1)))
+
+
+class StubGenerator:
+    """Fixed items, no network. A stub job is one deterministic stream of
+    items: the first STUB_MIXED_COUNT are a deliberately mixed batch — one
+    good item, a duplicate of it, and one bad item per rejection rule — so
+    the worker exercises every path; everything after that is good and
+    unique. Chunk `i` is the stream from `i * chunk size` on, where the
+    chunk size is settings.generator_chunk_size (the worker's convention, so
+    a short last chunk lands in the right place) or `count` if that is larger.
     """
 
     name = "stub"
@@ -189,12 +200,8 @@ class StubGenerator:
         chunk_index: int,
         avoid: Sequence[str] = (),
     ) -> GeneratedChunk:
-        if chunk_index != 0:
-            start = chunk_index * 1000
-            return GeneratedChunk([_good(start + i, params) for i in range(count)])
-
-        first = _good(0, params)
-        mixed: list[Any] = [first, copy.deepcopy(first)]  # second is duplicate_in_batch
-        mixed.extend(_bad_items(params))
-        mixed.extend(_good(i, params) for i in range(len(mixed), count))
-        return GeneratedChunk(mixed[:count])
+        start = chunk_index * max(settings.generator_chunk_size, count)
+        mixed = _mixed_items(params)
+        items: list[Any] = mixed[start : start + count]
+        items.extend(_good(1000 + i, params) for i in range(max(start, len(mixed)), start + count))
+        return GeneratedChunk(items)

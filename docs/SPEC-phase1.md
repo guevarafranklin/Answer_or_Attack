@@ -407,7 +407,7 @@ The admin types natural language ("Create 100 math questions from first grade to
 ### 5.2 Worker flow
 
 1. Mark job `running`.
-2. **Batch into chunks of 20.** Never ask for 100 questions in one call — quality degrades and one malformed response loses everything.
+2. **Batch into small chunks** (`GENERATOR_CHUNK_SIZE`, default 10). Never ask for 100 questions in one call — quality degrades and one malformed or truncated response loses everything. Each call's output is capped at `GENERATOR_MAX_TOKENS` (default 16000); explanations are limited to one sentence (≤200 chars) per locale in the prompt because they dominate output tokens.
 3. For each chunk, request strict JSON with both locales in a single call (translating in one pass keeps option order aligned):
 ```json
 {"questions":[{
@@ -444,7 +444,7 @@ Rejected items are counted, not stored. Rejection reason codes are stable string
 
 The Claude backend (`GENERATOR_BACKEND=claude`, `app/services/claude_generator.py`) puts this guidance and the §5.2 limits in the system prompt, and the job params (difficulty range, grade bands, region, style notes) in the per-chunk user message. Each chunk is one Messages API call asking for both locales as strict JSON (structured outputs enforce the §5.2 shape; `GENERATOR_STRUCTURED_OUTPUT=false` turns that off for a model without support). Later chunks also get a "don't repeat these topics" list — the `tags: answer` summary of every item the job has accepted so far, not the stems — so a 200-question job doesn't circle back to the same facts.
 
-Per-chunk failure policy: a transient API error (connection/timeout, 429, 5xx) is retried once after a backoff (honouring `Retry-After`); any other API error or a response that isn't the expected JSON fails the chunk immediately, with no retry. The usage a failed call consumed still counts toward `cost_cents`. The stub backend (`GENERATOR_BACKEND=stub`, the default) never touches the network.
+Per-chunk failure policy: a transient API error (connection/timeout, 429, 5xx) is retried once after a backoff (honouring `Retry-After`); any other API error or a response that isn't the expected JSON fails the chunk immediately, with no retry. The chunk error records the response's `stop_reason`, so a truncation reads as `malformed JSON (stop_reason=max_tokens): ...` in `stats.chunk_errors`. The usage a failed call consumed still counts toward `cost_cents`. The stub backend (`GENERATOR_BACKEND=stub`, the default) never touches the network.
 
 ---
 

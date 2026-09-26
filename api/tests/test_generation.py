@@ -10,14 +10,21 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.main import app
 from app.models import Category, GenerationJob, Question, QuestionTranslation
 from app.queue import GENERATE_JOB, get_queue
 from app.schemas.generation import GenerationParams
 from app.services import validation as v
-from app.services.generator import GeneratedChunk, StubGenerator, get_generator, topic_summary
+from app.services.generator import (
+    STUB_MIXED_COUNT,
+    GeneratedChunk,
+    StubGenerator,
+    get_generator,
+    topic_summary,
+)
 from app.services.validation import content_hash
-from app.workers.generation import CHUNK_SIZE, chunk_sizes, generate_questions
+from app.workers.generation import chunk_sizes, generate_questions
 from tests.test_validation import item
 
 # ---------- helpers ----------
@@ -43,9 +50,11 @@ class ListGenerator:
     def __init__(self, chunks: list[list[Any] | Exception]):
         self.chunks = chunks
         self.avoid_seen: list[list[str]] = []  # the `avoid` hint passed per call
+        self.counts: list[int] = []  # the chunk size asked for per call
 
     async def generate(self, params, count, chunk_index, avoid=()):
         self.avoid_seen.append(list(avoid))
+        self.counts.append(count)
         chunk = self.chunks[chunk_index]
         if isinstance(chunk, Exception):
             raise chunk
@@ -204,15 +213,21 @@ async def test_get_job_and_list(client: AsyncClient, admin_headers, db: AsyncSes
 # ---------- stub generator ----------
 
 
-def test_get_generator_defaults_to_stub():
+def test_get_generator_stub_backend(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(settings, "generator_backend", "stub")
     assert isinstance(get_generator(), StubGenerator)
 
 
 @pytest.mark.asyncio
-async def test_stub_chunk_zero_hits_every_rejection_rule():
-    p = GenerationParams(category_slug="math", count=CHUNK_SIZE)
-    items = (await StubGenerator().generate(p, CHUNK_SIZE, 0)).items
-    assert len(items) == CHUNK_SIZE
+async def test_stub_mixed_batch_hits_every_rejection_rule():
+    """The mixed batch spans the first STUB_MIXED_COUNT items of the stream,
+    however it is chunked."""
+    p = GenerationParams(category_slug="math", count=STUB_MIXED_COUNT)
+    size = 10
+    items: list = []
+    for chunk_index in range(STUB_MIXED_COUNT // size):
+        items += (await StubGenerator().generate(p, size, chunk_index)).items
+    assert len(items) == STUB_MIXED_COUNT
 
     codes: set[str] = set()
     clean: list[v.CleanItem] = []
@@ -241,7 +256,8 @@ async def test_stub_later_chunks_are_clean_and_respect_params():
     p = GenerationParams(
         category_slug="math", count=30, difficulty_min=2, difficulty_max=3, grade_bands=["g4_g6"]
     )
-    items = (await StubGenerator().generate(p, 10, 1)).items
+    first_clean_chunk = STUB_MIXED_COUNT // 10
+    items = (await StubGenerator().generate(p, 10, first_clean_chunk)).items
     assert len(items) == 10
     for raw in items:
         clean = v.validate_item(raw)
@@ -257,9 +273,22 @@ async def test_stub_later_chunks_are_clean_and_respect_params():
 
 
 def test_chunk_sizes():
-    assert chunk_sizes(45) == [20, 20, 5]
-    assert chunk_sizes(20) == [20]
+    assert chunk_sizes(25) == [10, 10, 5]  # default GENERATOR_CHUNK_SIZE
+    assert chunk_sizes(10) == [10]
     assert chunk_sizes(1) == [1]
+    assert chunk_sizes(45, size=20) == [20, 20, 5]
+
+
+@pytest.mark.asyncio
+async def test_chunk_size_setting_is_honored(db: AsyncSession, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(settings, "generator_chunk_size", 3)
+    assert chunk_sizes(7) == [3, 3, 1]
+    await _category(db)
+    gen = ListGenerator([[good(1)], [good(2)], [good(3)]])
+    job = await _run(db, await _job(db, 7), gen)
+    assert gen.counts == [3, 3, 1]
+    assert job.stats["chunks_total"] == 3
+    assert job.accepted_count == 3
 
 
 @pytest.mark.asyncio
@@ -318,7 +347,7 @@ async def test_mixed_batch_lands_right_counts_and_status(db: AsyncSession):
 @pytest.mark.asyncio
 async def test_chunk_that_raises_gives_partial_and_keeps_other_chunks(db: AsyncSession):
     await _category(db)
-    job = await _job(db, 45)  # chunks: 20, 20, 5
+    job = await _job(db, 25)  # chunks: 10, 10, 5
     gen = ListGenerator([[good(1), good(2)], RuntimeError("model exploded"), [good(3)]])
     job = await _run(db, job, gen)
 
@@ -356,7 +385,7 @@ async def test_none_accepted_is_failed(db: AsyncSession):
 @pytest.mark.asyncio
 async def test_every_chunk_raising_is_failed(db: AsyncSession):
     await _category(db)
-    job = await _job(db, 25)
+    job = await _job(db, 20)
     job = await _run(db, job, ListGenerator([RuntimeError("a"), ValueError("b")]))
     assert job.status == "failed"
     assert job.produced_count == 0
@@ -426,7 +455,7 @@ async def test_malformed_twin_first_then_valid_is_accepted_and_counted(db: Async
 @pytest.mark.asyncio
 async def test_seen_carries_across_chunks(db: AsyncSession):
     await _category(db)
-    job = await _job(db, 21)
+    job = await _job(db, 11)
     job = await _run(db, job, ListGenerator([[good(1)], [good(1)]]))
     assert (job.accepted_count, job.rejected_count) == (1, 1)
     # Chunk 0 committed the row, so the repeat is both an in-batch duplicate
@@ -455,15 +484,16 @@ async def test_terminal_job_is_not_rerun(db: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_stub_end_to_end(db: AsyncSession):
-    """A stub job of 25 = one mixed chunk (1 accepted) + one clean chunk (5)."""
+    """A stub job of 25 = the 20-item mixed batch (1 accepted) over two
+    chunks + one clean chunk of 5."""
     await _category(db)
-    job = await _job(db, 25)
+    job = await _job(db, STUB_MIXED_COUNT + 5)
     job = await _run(db, job, StubGenerator())
 
     assert job.status == "partial"
     assert job.model == "stub"
     assert (job.produced_count, job.accepted_count, job.rejected_count) == (25, 6, 19)
-    assert job.stats["chunks_total"] == 2
+    assert job.stats["chunks_total"] == 3
     assert job.stats["repeated"] == 1
     assert len(job.stats["rejections"]) >= 18
     rows = await _questions_for(db, job)
@@ -475,7 +505,7 @@ async def test_nothing_is_ever_inserted_as_live(db: AsyncSession):
     """Across a stub run and a hand-built run, every generated row is pending."""
     await _category(db)
     for gen in (StubGenerator(), ListGenerator([[good(1), good(2)]])):
-        await _run(db, await _job(db, 20), gen)
+        await _run(db, await _job(db, 10), gen)
     non_pending = (
         await db.execute(
             select(func.count()).select_from(Question).where(Question.status != "pending")
@@ -493,7 +523,7 @@ async def test_accepted_topics_are_passed_to_later_chunks_as_avoid_hints(db: Asy
     """Each chunk gets the topic summaries of everything accepted so far —
     rejected items contribute nothing."""
     await _category(db)
-    job = await _job(db, 45)  # chunks: 20, 20, 5
+    job = await _job(db, 25)  # chunks: 10, 10, 5
     bad = item(difficulty=0)
     gen = ListGenerator([[good(1), bad], [good(2)], []])
     await _run(db, job, gen)

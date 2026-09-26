@@ -16,7 +16,6 @@ from app.schemas.generation import GenerationParams
 from app.services import claude_generator as cg
 from app.services.claude_generator import ClaudeGenerator, build_user_prompt
 from app.services.generator import GeneratedChunk, GeneratorError, Usage, get_generator
-from app.workers.generation import CHUNK_SIZE
 from tests.test_generation import _category, _job, _questions_for, _run
 from tests.test_validation import item
 
@@ -137,7 +136,7 @@ async def test_request_asks_for_strict_json_in_one_call():
     [req] = replay.requests
     assert req["model"] == MODEL
     assert req["output_config"]["format"] == {"type": "json_schema", "schema": cg.RESPONSE_SCHEMA}
-    assert req["max_tokens"] >= 20 * cg.MAX_TOKENS_PER_ITEM
+    assert req["max_tokens"] == settings.generator_max_tokens == 16000
     assert [m["role"] for m in req["messages"]] == ["user"]
     system = req["system"]
     # §5.3 guidance and the §5.2 rules live in the system prompt.
@@ -151,6 +150,7 @@ async def test_request_asks_for_strict_json_in_one_call():
         "at most 120 characters",
         "at most 60 characters",
         "Exactly 4 options",
+        "explanation: one sentence, at most 200 characters",
     ):
         assert phrase in system, phrase
     # Both locales in one call, in the §5.2 shape.
@@ -158,6 +158,18 @@ async def test_request_asks_for_strict_json_in_one_call():
     user = req["messages"][0]["content"]
     assert user.startswith("Write exactly 20 questions for the category: science.")
     assert "provide both en and es" in user
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_setting_is_honored(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(settings, "generator_max_tokens", 4096)
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-key")
+    gen = ClaudeGenerator.from_settings()
+    assert gen._max_tokens == 4096
+
+    gen, replay, _ = make_generator(ok())  # no explicit max_tokens: reads the setting
+    await gen.generate(params(), 2, 0)
+    assert replay.requests[0]["max_tokens"] == 4096
 
 
 @pytest.mark.asyncio
@@ -208,9 +220,9 @@ def test_avoid_hints_are_capped_to_the_newest():
 @pytest.mark.parametrize(
     "text, stop_reason, expected",
     [
-        ('{"questions": [{"difficulty": 3', "max_tokens", "response truncated at max_tokens"),
-        ("Sure! Here are the questions:\n{...}", "end_turn", "malformed JSON"),
-        ('{"items": []}', "end_turn", 'expected {"questions": [...]}'),
+        ('{"questions": [{"difficulty": 3', "max_tokens", "malformed JSON (stop_reason=max_tokens)"),
+        ("Sure! Here are the questions:\n{...}", "end_turn", "malformed JSON (stop_reason=end_turn)"),
+        ('{"items": []}', "end_turn", 'malformed JSON (stop_reason=end_turn): expected {"questions": [...]}'),
         ('"just a string"', "end_turn", 'expected {"questions": [...]}'),
     ],
 )
@@ -310,7 +322,7 @@ async def test_worker_records_cost_and_model_from_real_usage(db: AsyncSession):
     """Two chunks, two recorded responses: cost_cents is the priced sum of
     the returned usage, rounded, and `model` is the generator's model."""
     await _category(db, "science")
-    job = await _job(db, CHUNK_SIZE + 2, slug="science")
+    job = await _job(db, settings.generator_chunk_size + 2, slug="science")
     gen, replay, _ = make_generator(
         ok(input_tokens=10_000, output_tokens=20_000),  # 3¢ + 30¢
         ok([item(**{"en.stem": "What is 3 + 3?"})], input_tokens=5_000, output_tokens=1_000),  # 1.5¢ + 1.5¢
@@ -333,7 +345,7 @@ async def test_worker_records_cost_and_model_from_real_usage(db: AsyncSession):
 @pytest.mark.asyncio
 async def test_worker_keeps_cost_of_a_malformed_chunk(db: AsyncSession):
     await _category(db, "science")
-    job = await _job(db, CHUNK_SIZE + 1, slug="science")
+    job = await _job(db, settings.generator_chunk_size + 1, slug="science")
     gen, _, _ = make_generator(
         httpx2.Response(200, json=message_body("not json", input_tokens=4_000, output_tokens=2_000)),
         ok(input_tokens=1_000, output_tokens=1_000),
@@ -342,7 +354,38 @@ async def test_worker_keeps_cost_of_a_malformed_chunk(db: AsyncSession):
 
     assert job.status == "partial"
     assert job.stats["chunks_failed"] == 1
-    assert job.stats["chunk_errors"] == ["chunk 0: GeneratorError: malformed JSON: Expecting value: line 1 column 1 (char 0)"]
+    assert job.stats["chunk_errors"] == [
+        "chunk 0: GeneratorError: malformed JSON (stop_reason=end_turn): Expecting value: line 1 column 1 (char 0)"
+    ]
     assert job.accepted_count == 2
     assert (job.stats["input_tokens"], job.stats["output_tokens"]) == (5_000, 3_000)
     assert job.cost_cents == round(expected_cents(5_000, 3_000)) == 6
+
+
+@pytest.mark.asyncio
+async def test_truncated_chunk_with_default_settings_fails_that_chunk_only(db: AsyncSession):
+    """A response cut off at max_tokens (the first real job's failure) is a
+    failed chunk naming stop_reason=max_tokens; the job carries on and the
+    request used the configured ceiling and chunk size."""
+    await _category(db, "science")
+    job = await _job(db, settings.generator_chunk_size + 1, slug="science")
+    full = json.dumps({"questions": RECORDED_QUESTIONS})
+    truncated = full[: len(full) // 2]  # cut mid-item, like the real one
+    gen, replay, sleep = make_generator(
+        httpx2.Response(200, json=message_body(truncated, input_tokens=3_000, output_tokens=16_000, stop_reason="max_tokens")),
+        ok(),
+    )
+    job = await _run(db, job, gen)
+
+    assert [r["max_tokens"] for r in replay.requests] == [16000, 16000]
+    assert replay.requests[0]["messages"][0]["content"].startswith(
+        f"Write exactly {settings.generator_chunk_size} questions"
+    )
+    assert replay.requests[1]["messages"][0]["content"].startswith("Write exactly 1 questions")
+    assert sleep.calls == []  # truncation is not retried
+    assert job.status == "partial"
+    assert job.stats["chunks_failed"] == 1
+    [err] = job.stats["chunk_errors"]
+    assert err.startswith("chunk 0: GeneratorError: malformed JSON (stop_reason=max_tokens): ")
+    assert job.accepted_count == 2
+    assert job.stats["output_tokens"] == 16_000 + 2000  # the truncated call still counts
