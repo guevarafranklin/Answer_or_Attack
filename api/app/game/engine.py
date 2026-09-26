@@ -36,6 +36,13 @@ Decisions the spec leaves open, all deliberate and all tested:
   answers to round questions, never blocks.
 * "Can pay" for an attack means `xp > 0`, literally per §2.4; the cost is
   floored at 0.
+* The floor itself is a secret: a delta that stops falling would say "this
+  player is at 0", and with the deltas known that gives away the start.
+  So every player carries two deltas — `nominal_delta`, the sum of every
+  scoring change as nominally applied (points, attack cost, block damage,
+  steal), and the real `delta` (floored xp − starting_xp). Messages before
+  `Ended` only ever carry the nominal one; scoring and the tiebreak use
+  the real one; `Ended` shows both.
 """
 from __future__ import annotations
 
@@ -96,7 +103,8 @@ class Player:
     display_name: str
     connected_since_ms: int
     starting_xp: int = 0
-    xp: int = 0
+    xp: int = 0  # real, floored at 0 — secret until the end
+    nominal_delta: int = 0  # every change as applied, floor ignored — public
     streak: int = 0
     tokens: int = 0
     present: bool = True
@@ -107,7 +115,14 @@ class Player:
 
     @property
     def delta(self) -> int:
+        """The real delta; never sent before the end."""
         return self.xp - self.starting_xp
+
+    def score(self, points: int) -> None:
+        """Apply a scoring change: the nominal delta takes it in full, the
+        real XP takes what the floor allows."""
+        self.nominal_delta += points
+        self.xp = max(0, self.xp + points)
 
     @property
     def active(self) -> bool:
@@ -162,7 +177,8 @@ class PlayerResult:
     display_name: str
     starting_xp: int
     final_xp: int
-    delta: int
+    delta: int  # real: final_xp - starting_xp
+    nominal_delta: int  # what the room watched all game
     mean_correct_ms: float | None
 
 
@@ -346,7 +362,7 @@ class AnswerAck:
 class PlayerOutcome:
     outcome: Outcome
     points: int  # nominal; the XP floor can absorb a negative one
-    delta: int
+    delta: int  # nominal (Player.nominal_delta)
     streak: int
     tokens: int
     token_earned: bool
@@ -386,8 +402,8 @@ class BlockResolved:
     attacker_ids: tuple[str, ...]
     blocked: bool
     outcome: Outcome
-    damage: int  # XP actually lost (after the floor)
-    delta: int  # the target's new delta
+    damage: int  # nominal: attack_damage per attacker; the floor may absorb some
+    delta: int  # the target's new nominal delta
     steal: int = 0  # XP each attacker gained (config.attack_steal on a failed block)
 
 
@@ -622,7 +638,7 @@ def _on_attack(s: GameState, ev: Attack, now: int, rng: Rng, out: list[Message])
         _err(out, p.id, "target_full", "that player already has enough incoming attacks")
         return
     p.tokens -= 1
-    p.xp = max(0, p.xp - s.config.attack_cost)
+    p.score(-s.config.attack_cost)
     s.attacks.append(PendingAttack(p.id, target.id))
     s.acted_this_window.add(p.id)
     out.append(AttackDeclared(p.id, target.id))
@@ -826,8 +842,10 @@ def _reveal(s: GameState, now: int, out: list[Message]) -> None:
         else:
             outcome, points = "incorrect", cfg.points_wrong
             p.streak = 0
-        p.xp = max(0, p.xp + points)
-        outcomes[p.id] = PlayerOutcome(outcome, points, p.delta, p.streak, p.tokens, token_earned)
+        p.score(points)
+        outcomes[p.id] = PlayerOutcome(
+            outcome, points, p.nominal_delta, p.streak, p.tokens, token_earned
+        )
         s.serves.append(
             ServeRecord(q.id, p.id, outcome, ans.response_ms if ans else None, s.round, "question")
         )
@@ -884,8 +902,9 @@ def _draw_block(s: GameState, rng: Rng) -> Question | None:
 
 def _resolve_blocks(s: GameState, now: int, rng: Rng, out: list[Message]) -> None:
     """§2.4 BLOCK: correct blocks everything; wrong/timeout costs
-    attack_damage per incoming attack, floored at 0, and pays each
-    attacker attack_steal regardless of how much the target could lose.
+    attack_damage per incoming attack (the real XP floored at 0, the
+    nominal delta in full) and pays each attacker attack_steal regardless
+    of how much the target could lose.
     Never touches streaks or tokens. An absent target times out like
     anyone else (§2.8)."""
     cfg = s.config
@@ -901,12 +920,11 @@ def _resolve_blocks(s: GameState, now: int, rng: Rng, out: list[Message]) -> Non
             outcome, blocked = "timeout", False
         damage = steal = 0
         if not blocked:
-            before = target.xp
-            target.xp = max(0, target.xp - cfg.attack_damage * len(block.attacker_ids))
-            damage = before - target.xp
+            damage = cfg.attack_damage * len(block.attacker_ids)
+            target.score(-damage)
             steal = cfg.attack_steal
             for attacker_id in block.attacker_ids:
-                s.players[attacker_id].xp += steal
+                s.players[attacker_id].score(steal)
         if q is not None:
             s.serves.append(
                 ServeRecord(
@@ -915,7 +933,13 @@ def _resolve_blocks(s: GameState, now: int, rng: Rng, out: list[Message]) -> Non
             )
         out.append(
             BlockResolved(
-                target.id, tuple(block.attacker_ids), blocked, outcome, damage, target.delta, steal
+                target.id,
+                tuple(block.attacker_ids),
+                blocked,
+                outcome,
+                damage,
+                target.nominal_delta,
+                steal,
             )
         )
     _start_round(s, now, rng, out)
@@ -924,7 +948,9 @@ def _resolve_blocks(s: GameState, now: int, rng: Rng, out: list[Message]) -> Non
 def _end_game(s: GameState, reason: EndReason, out: list[Message]) -> None:
     ranked = sorted(s.players.values(), key=_rank_key)
     s.results = [
-        PlayerResult(p.id, p.display_name, p.starting_xp, p.xp, p.delta, p.mean_correct_ms)
+        PlayerResult(
+            p.id, p.display_name, p.starting_xp, p.xp, p.delta, p.nominal_delta, p.mean_correct_ms
+        )
         for p in ranked
     ]
     winners, tiebreak = _winners(ranked)
@@ -935,6 +961,14 @@ def _end_game(s: GameState, reason: EndReason, out: list[Message]) -> None:
     s.board = []
     out.append(PhaseChanged(Phase.END, s.round, None, None))
     out.append(Ended(reason, tuple(s.results), tuple(p.id for p in winners), tiebreak))
+
+
+def ended(s: GameState) -> Ended:
+    """The Ended fact again for a finished game (a reconnect at END)."""
+    assert s.phase is Phase.END and s.results is not None and s.end_reason is not None
+    ranked = [s.players[r.player_id] for r in s.results]
+    winners, tiebreak = _winners(ranked)
+    return Ended(s.end_reason, tuple(s.results), tuple(p.id for p in winners), tiebreak)
 
 
 def _rank_key(p: Player) -> tuple[int, int, float]:

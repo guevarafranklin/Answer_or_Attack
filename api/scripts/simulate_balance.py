@@ -158,6 +158,7 @@ def play_game(config: GameConfig, bots: list[Bot], seed: int) -> GameRecord:
         nonlocal now, state, attacks, landed, on_zero, passes, tokens, ended
         if at is not None:
             now = max(now, at)
+        xp_before = {p.id: p.xp for p in state.players.values()}
         state, msgs = step(state, event, now, engine_rng, copy_state=False)
         for m in msgs:
             if isinstance(m, AttackDeclared):
@@ -166,7 +167,7 @@ def play_game(config: GameConfig, bots: list[Bot], seed: int) -> GameRecord:
                 passes += 1
             elif isinstance(m, BlockResolved) and not m.blocked:
                 landed += len(m.attacker_ids)
-                if m.damage == 0:
+                if xp_before[m.target_id] == 0:  # m.damage is nominal (§2.6)
                     on_zero += len(m.attacker_ids)
             elif isinstance(m, Revealed):
                 tokens += sum(o.token_earned for o in m.outcomes.values())
@@ -241,7 +242,7 @@ def _act_in_attack_window(state: GameState, bot: Bot, rng: random.Random, send) 
         return
     others = [p for p in state.active_players() if p.id != bot.id]
     if bot.policy == "greedy":
-        others.sort(key=lambda p: -p.delta)
+        others.sort(key=lambda p: -p.nominal_delta)  # the public delta
     else:
         rng.shuffle(others)
     for target in others:

@@ -637,11 +637,31 @@ def test_xp_never_goes_below_zero():
     rev = g.play_question({"p0": False})
     assert g.player("p0").xp == 0
     assert rev.outcomes["p0"].points == -1  # nominal, absorbed by the floor
-    assert rev.outcomes["p0"].delta == -1
+    assert rev.outcomes["p0"].delta == -2  # the public delta keeps falling
     g.past_reveal()
     g.round_trip({})  # timeout at zero
     assert g.player("p0").xp == 0
-    assert g.player("p0").delta == -1
+    assert g.player("p0").delta == -1  # the real delta stopped at the floor
+    assert g.player("p0").nominal_delta == -3
+
+
+def test_the_public_delta_ignores_the_floor_for_every_kind_of_loss():
+    """A real delta that stops falling would say "this player is at 0" and,
+    with deltas public, give the start away. So the nominal delta takes
+    points, attack cost, block damage and steal in full and is the only
+    delta shown before the end; the real one decides the game."""
+    g = armed_game(config=GameConfig.from_overrides(CFG.summary(), attack_steal=2, attack_cost=5))
+    g.player("p0").xp = 1  # armed attacker, nearly broke
+    g.player("p1").xp = 2  # target, nearly broke
+    nominal0, nominal1 = g.player("p0").nominal_delta, g.player("p1").nominal_delta
+    g.send(Attack("p0", "p1"))
+    assert g.player("p0").xp == 0 and g.player("p0").nominal_delta == nominal0 - 5
+    res = one(g.tick(), BlockResolved)  # p1 times out
+    assert res.damage == 3 and res.delta == nominal1 - 3  # nominal, not the 2 actually lost
+    assert g.player("p1").xp == 0 and g.player("p1").nominal_delta == nominal1 - 3
+    assert g.player("p0").xp == 2 and g.player("p0").nominal_delta == nominal0 - 5 + 2
+    rev = g.play_question({"p1": False})
+    assert rev.outcomes["p1"].delta == nominal1 - 4 and g.player("p1").xp == 0
 
 
 def test_streak_resets_on_wrong_answer():
@@ -1066,7 +1086,9 @@ def test_amendment_a_zero_xp_player_can_be_attacked_for_no_damage():
     assert g.player("p0").xp == xp0 - 1  # attacker still pays
     g.tick()  # block timeout: the worst case for the target
     res = one(g.log, BlockResolved)
-    assert (res.target_id, res.blocked, res.outcome, res.damage) == ("p1", False, "timeout", 0)
+    # The message states the nominal damage: "0" would tell the target
+    # (and anyone reading their delta) that they sit at the floor.
+    assert (res.target_id, res.blocked, res.outcome, res.damage) == ("p1", False, "timeout", 3)
     assert g.player("p1").xp == 0
 
 
@@ -1165,7 +1187,7 @@ def test_block_damage_is_floored_at_zero():
     g.send(Attack("p0", "p1"))
     g.player("p1").xp = 2
     res = one(g.block_answer("p1", right=False), BlockResolved)
-    assert res.damage == 2
+    assert res.damage == 3  # nominal; the floor absorbed one
     assert g.player("p1").xp == 0
 
 
@@ -1224,7 +1246,7 @@ def test_attack_steal_is_paid_in_full_when_the_target_is_floored():
     g.send(Attack("p0", "p1"))
     xp = g.player("p0").xp
     res = one(g.tick(), BlockResolved)
-    assert (res.damage, res.steal) == (0, 2)
+    assert (res.damage, res.steal) == (3, 2)  # nominal damage, full bounty
     assert g.player("p0").xp == xp + 2
     assert g.player("p1").xp == 0
 
@@ -1257,7 +1279,7 @@ def test_attack_steal_counts_toward_the_final_ranking():
     g.send(Attack("p0", "p1"))
     g.tick()  # p1 times out: p1 -> 9, p0 -> 10 - 1 + 3 = 12
     assert (g.player("p0").xp, g.player("p1").xp) == (12, 9)
-    assert one(g.log, BlockResolved).delta == 9 - 10
+    assert one(g.log, BlockResolved).delta == g.player("p1").nominal_delta  # not 9 - 10
     ended = finish(g)  # one more round, everyone times out
     assert ended.winner_ids == ("p0",)
     by_id = {r.player_id: r for r in ended.results}
@@ -1711,6 +1733,7 @@ def test_random_games_keep_every_invariant(seed):
             assert p.xp >= 0
             assert 0 <= p.tokens <= cfg.max_tokens
             assert p.delta == p.xp - p.starting_xp
+            assert p.delta >= p.nominal_delta  # the floor only ever helps
         for p in s.active_players():
             assert s.incoming_attacks(p.id) <= cfg.max_incoming_attacks
         assert s.round <= cfg.question_count

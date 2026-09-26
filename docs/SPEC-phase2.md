@@ -94,8 +94,9 @@ LOBBY → [host starts] →
 **B. Questions are drawn per category, not as one ordered list.** Because the picker chooses a category each round, the session draws a **pool per category** at start (ramped by difficulty within each pool), plus a **block reserve** of difficulty 2–3 questions. This changes the Phase 1 `POST /sessions/generate` shape (see §6).
 
 ### 2.6 Visibility
-- During the game every player sees: all display names, each player's **delta** (current − starting), who holds the pick, the round number. Nobody sees totals or starting XP, including their own starting XP. Players see their own token count; others see only that *someone* attacked whom.
-- At END: everyone's starting XP, final total, and delta are revealed.
+- During the game every player sees: all display names, each player's **nominal delta** (below), who holds the pick, the round number. Nobody sees totals or starting XP, including their own starting XP. Players see their own token count; others see only that *someone* attacked whom.
+- **Two deltas.** The XP floor is itself a secret: a delta that stops falling says "this player is at 0", and with the deltas public that gives their start away. So the engine keeps, per player, the **nominal delta** — the sum of every scoring change as nominally applied (+3 / −1 / −1, `attack_cost`, `attack_damage` per incoming attack, `attack_steal`), the floor ignored — next to the real, floored XP. Everything shown before END (`reveal`, the roster, `block_result`, the reconnect `state`) is the nominal delta; the nominal block damage is what the target is told. Scoring, the ranking and the tiebreak use the real XP.
+- At END: everyone's starting XP, final total, real delta (final − starting) and nominal delta are revealed; the final screen shows both.
 
 ### 2.7 Winner and tiebreak
 Highest **final total** wins (the hidden start is the point of the game). Ties: higher delta → lower mean response time on correct answers (round questions only, never blocks; a player with no correct answer loses this step) → shared win. No sudden-death round in MVP.
@@ -159,12 +160,12 @@ All messages are JSON `{ "type": ..., ... }`. Server times are epoch millisecond
 | `board` | categories offered + picker id (PICK) |
 | `question` | `{question_id, stem, options, deadline_ms}` — **no correct_index** |
 | `answer_ack` | your answer was received in time / too late |
-| `reveal` | `correct_option`, your `outcome`, your `delta`, everyone's deltas, tokens you hold |
+| `reveal` | `correct_option`, your `outcome`, your nominal `delta`, everyone's nominal deltas, tokens you hold |
 | `attacks` | who attacked whom this window (no XP values) |
 | `block_question` | only to attacked players |
-| `block_result` | per target: blocked or not; target also sees own new delta |
+| `block_result` | per target: blocked or not; target also sees nominal damage and own new nominal delta; attackers their own gain |
 | `presence` | player joined / absent / returned / dropped |
-| `end` | full reveal: starting, final, delta, winner, tiebreak used |
+| `end` | full reveal: starting, final, real delta, nominal delta, winner, tiebreak used |
 | `error` | `{code, message}` — e.g. `not_your_pick`, `no_token`, `target_full`, `too_late` |
 
 Reconnecting clients receive a full `state` message built by the same per-recipient serializer.
@@ -234,6 +235,7 @@ Also add a balance simulator: `scripts/simulate_balance.py` runs the pure engine
 ## 9. Definition of done
 
 - [ ] Engine unit tests cover every rule in §2, including both amendments, floors, token cap, incoming-attack cap, streak reset, absent handling, tiebreaks
+- [ ] Leak tests: for seeded games where someone hits 0, the public delta sequence is identical to one computed without the floor
 - [ ] Serializer tests prove no client message ever contains `correct_index` before reveal, any `starting_xp` or total before END, or another player's tokens
 - [ ] A full game plays end to end in the web client with 3 browser tabs
 - [ ] Killing and restarting the API mid-round resumes the session from the Redis snapshot
