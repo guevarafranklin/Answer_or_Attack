@@ -40,7 +40,10 @@ class GenerationJob(Base):
     # failed validation or deduped
     rejected_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     cost_cents: Mapped[int | None] = mapped_column(Integer)
-    error: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)  # human-readable summary
+    # Structured diagnostics (migration 0002): rejection reasons with counts,
+    # repeat_rate, chunk failures. See app.schemas.generation.GenerationStats.
+    stats: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
     created_at: Mapped[TimestampNow]
     started_at: Mapped[Timestamp]
     finished_at: Mapped[Timestamp]

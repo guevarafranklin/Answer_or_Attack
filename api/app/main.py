@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 
-from app.routers import categories
+from app.routers import categories, generation
 
 app = FastAPI(title="Answer or Attack — Content API")
 app.include_router(categories.router)
+app.include_router(generation.router)
 
 
 @app.get("/health")

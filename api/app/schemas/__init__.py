@@ -19,6 +19,7 @@ from app.schemas.generation import (
     GenerationJobRead,
     GenerationParams,
     GenerationRequest,
+    GenerationStats,
 )
 from app.schemas.sessions import (
     SessionGenerateRequest,
@@ -46,6 +47,7 @@ __all__ = [
     "GenerationJobRead",
     "GenerationParams",
     "GenerationRequest",
+    "GenerationStats",
     "QuestionBulkAction",
     "QuestionListQuery",
     "QuestionRead",

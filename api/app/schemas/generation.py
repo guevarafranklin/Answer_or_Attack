@@ -13,6 +13,8 @@ from app.schemas.common import (
     Region,
 )
 
+MAX_JOB_COUNT = 200
+
 
 class GenerationParams(BaseModel):
     """Structured `generation_jobs.params` (§5.1). The API parses the admin's
@@ -20,7 +22,7 @@ class GenerationParams(BaseModel):
     generator unparsed."""
 
     category_slug: str
-    count: int = Field(ge=1, le=500)
+    count: int = Field(ge=1, le=MAX_JOB_COUNT)
     difficulty_min: int = Field(default=1, ge=1, le=5)
     difficulty_max: int = Field(default=5, ge=1, le=5)
     grade_bands: list[GradeBand] = Field(default_factory=list)
@@ -50,6 +52,22 @@ class GenerationAccepted(BaseModel):
     job_id: uuid.UUID
 
 
+class GenerationStats(BaseModel):
+    """`generation_jobs.stats`, written by the worker when a job finishes.
+    Every field defaults so a queued/running job (stats = {}) reads cleanly."""
+
+    # reason code -> count, over every rejected item (an item with several
+    # faults counts once per code).
+    rejections: dict[str, int] = Field(default_factory=dict)
+    # Diagnostic repeat tracking (app.services.validation.RepeatCounter).
+    emitted: int = 0
+    repeated: int = 0
+    repeat_rate: float = 0.0
+    chunks_total: int = 0
+    chunks_failed: int = 0
+    chunk_errors: list[str] = Field(default_factory=list)
+
+
 class GenerationJobRead(ORMModel):
     """GET /admin/generate/{job_id}: status + counts."""
 
@@ -66,6 +84,7 @@ class GenerationJobRead(ORMModel):
     rejected_count: int
     cost_cents: int | None
     error: str | None
+    stats: GenerationStats
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
