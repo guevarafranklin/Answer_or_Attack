@@ -75,8 +75,13 @@ Difficulty — judge by how many adults would answer correctly, not by how impor
 - 3: an interested amateur knows it (when the Byzantine Empire ended: 1453).
 - 4: an enthusiast knows it (the year of the Treaty of Westphalia).
 - 5: a specialist knows it.
+These anchors are calibration examples only. Never write a question about the Mona Lisa, the fall of the Berlin Wall, the end of the Byzantine Empire, or the Treaty of Westphalia.
 
 Answers must be facts: names, places, dates, numbers. Never a period or a classification ("Medieval history", "a mammal") as the answer.
+
+Settled facts only. Skip any question where historians disagree, where the answer depends on a counting convention ("how many Crusades"), or where precise wording changes the answer ("earliest", "first", "largest") unless the fact is uncontested. If the most exact answer is not among the options, the question is invalid.
+
+No answer in the stem. No option may repeat a distinctive word from the stem; if the stem gives away the answer, rewrite it.
 
 Distractors: every distractor must be plausible to someone who half-knows the topic — same era, same region, same type of thing as the answer (all years, all names, all numbers). No option that common sense alone can eliminate.
 

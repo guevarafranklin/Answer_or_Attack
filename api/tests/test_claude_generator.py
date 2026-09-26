@@ -169,6 +169,23 @@ def test_system_prompt_editorial_guidance():
         assert f"- {level}: " in system
         assert anchor in system, anchor
     assert "within that level" not in system  # old, grade-relative wording is gone
+    # The anchors calibrate; they are not topics to write about.
+    assert "These anchors are calibration examples only." in system
+    assert (
+        "Never write a question about the Mona Lisa, the fall of the Berlin Wall, "
+        "the end of the Byzantine Empire, or the Treaty of Westphalia." in system
+    )
+
+    # Settled facts only.
+    assert "Settled facts only." in system
+    assert "where historians disagree" in system
+    assert 'counting convention ("how many Crusades")' in system
+    assert '("earliest", "first", "largest") unless the fact is uncontested' in system
+    assert "If the most exact answer is not among the options, the question is invalid." in system
+
+    # No answer in the stem.
+    assert "No answer in the stem." in system
+    assert "No option may repeat a distinctive word from the stem" in system
 
     # Distractors: plausible to a half-expert, nothing eliminable by common sense.
     assert "plausible to someone who half-knows the topic" in system
