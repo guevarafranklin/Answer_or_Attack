@@ -17,8 +17,15 @@ import { detailToMessages } from "./errors";
 import type {
   BulkAction,
   Category,
+  CategoryCreate,
+  CategoryUpdate,
   ErrorDetail,
   GenerationJob,
+  GenerationRequest,
+  HealthPage,
+  HealthSummary,
+  HealthView,
+  ParseResponse,
   Question,
   QuestionBulkResult,
   QuestionListQuery,
@@ -91,6 +98,12 @@ async function request<T>(
 
 export const listCategories = () => request<Category[]>("GET", "/admin/categories");
 
+export const createCategory = (data: CategoryCreate) =>
+  request<Category>("POST", "/admin/categories", { body: data });
+
+export const updateCategory = (id: string, patch: CategoryUpdate) =>
+  request<Category>("PATCH", `/admin/categories/${id}`, { body: patch });
+
 // ---------- review queue ----------
 
 export const listQuestions = (query: QuestionListQuery) =>
@@ -119,3 +132,18 @@ export const listJobs = (limit = 50) =>
   request<GenerationJob[]>("GET", "/admin/generate", { query: { limit } });
 
 export const getJob = (id: string) => request<GenerationJob>("GET", `/admin/generate/${id}`);
+
+/** Free text → §5.1 params for the admin to confirm. Creates nothing. */
+export const parsePrompt = (prompt: string) =>
+  request<ParseResponse>("POST", "/admin/generate/parse", { body: { prompt } });
+
+/** 202 {job_id}: the job is queued; poll getJob/listJobs for progress. */
+export const createJob = (data: GenerationRequest) =>
+  request<{ job_id: string }>("POST", "/admin/generate", { body: data });
+
+// ---------- health ----------
+
+export const healthSummary = () => request<HealthSummary>("GET", "/admin/health/summary");
+
+export const healthView = (view: HealthView, page = 1, page_size = 50) =>
+  request<HealthPage>("GET", `/admin/health/${view}`, { query: { page, page_size } });

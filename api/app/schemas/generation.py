@@ -52,6 +52,21 @@ class GenerationAccepted(BaseModel):
     job_id: uuid.UUID
 
 
+class ParseRequest(BaseModel):
+    """POST /admin/generate/parse: the admin's free text, nothing else."""
+
+    prompt: str = Field(min_length=1, max_length=4000)
+
+
+class ParseResponse(BaseModel):
+    """What the admin confirms before a job is created. `notes` lists every
+    adjustment the parser made that the admin should know about (a clamped
+    count, a defaulted difficulty range)."""
+
+    params: GenerationParams
+    notes: list[str] = Field(default_factory=list)
+
+
 class GenerationStats(BaseModel):
     """`generation_jobs.stats`, written by the worker when a job finishes.
     Every field defaults so a queued/running job (stats = {}) reads cleanly."""

@@ -45,6 +45,27 @@ export interface Category {
   translations: CategoryTranslation[];
 }
 
+export interface CategoryTranslationIn {
+  name: string;
+  description?: string | null;
+}
+
+/** CategoryCreate: both locales are required. */
+export interface CategoryCreate {
+  slug: string;
+  icon?: string | null;
+  sort_order?: number;
+  translations: Record<Locale, CategoryTranslationIn>;
+}
+
+/** CategoryUpdate: every field optional; a locale that is sent is replaced, one omitted is kept. */
+export interface CategoryUpdate {
+  icon?: string | null;
+  sort_order?: number;
+  is_active?: boolean;
+  translations?: Partial<Record<Locale, CategoryTranslationIn>>;
+}
+
 // ---------- questions / review queue ----------
 
 export interface QuestionTranslation {
@@ -161,6 +182,60 @@ export interface GenerationJob {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+}
+
+/** POST /admin/generate: the prompt plus the params the admin confirmed. */
+export interface GenerationRequest {
+  prompt: string;
+  params: GenerationParams;
+  kind?: GenerationKind;
+}
+
+/** POST /admin/generate/parse → params to confirm; `notes` lists what the parser adjusted. */
+export interface ParseResponse {
+  params: GenerationParams;
+  notes: string[];
+}
+
+// ---------- health views (api/app/schemas/telemetry.py) ----------
+
+export type HealthView = "easy" | "suspect" | "dead";
+export const HEALTH_VIEWS: readonly HealthView[] = ["easy", "suspect", "dead"];
+
+export interface QuestionStats {
+  question_id: string;
+  serves: number;
+  correct: number;
+  incorrect: number;
+  timeouts: number;
+  absents: number;
+  reports: number;
+  avg_response_ms: number | null;
+  last_served_at: string | null;
+}
+
+/** HealthRow: the stats row, the view's ratio (correct/serves; timeouts/serves for dead) and the question. */
+export interface HealthRow extends QuestionStats {
+  ratio: number;
+  question: Question;
+}
+
+export interface HealthPage {
+  view: HealthView;
+  items: HealthRow[];
+  page: number;
+  page_size: number;
+  total: number;
+}
+
+export type StatusCounts = Record<QuestionStatus, number>;
+
+export interface HealthSummary {
+  pending_backlog: number;
+  by_status: StatusCounts;
+  by_category: { slug: string; counts: StatusCounts }[];
+  by_locale: Record<Locale, StatusCounts>;
+  health: Record<HealthView, number>;
 }
 
 // ---------- error bodies ----------

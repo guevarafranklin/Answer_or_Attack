@@ -13,7 +13,8 @@ function parseFilters(sp: Record<string, string | string[] | undefined>): Review
   return {
     category: first(sp.category) || undefined,
     difficulty: Number.isInteger(difficulty) && difficulty >= 1 && difficulty <= 5 ? difficulty : undefined,
-    job_id: first(sp.job_id) || undefined,
+    // Job rows on /generate and the dashboard link here as ?job=<id>.
+    job: first(sp.job) || first(sp.job_id) || undefined,
   };
 }
 
@@ -25,7 +26,14 @@ export default async function ReviewPage(props: PageProps<"/review">) {
   const [categories, jobs, questions] = await Promise.all([
     listCategories(),
     listJobs(50),
-    listQuestions({ status: "pending", ...filters, page, page_size: PAGE_SIZE }),
+    listQuestions({
+      status: "pending",
+      category: filters.category,
+      difficulty: filters.difficulty,
+      job_id: filters.job,
+      page,
+      page_size: PAGE_SIZE,
+    }),
   ]);
 
   // Keyed on the filters so a filter change resets the queue's local state

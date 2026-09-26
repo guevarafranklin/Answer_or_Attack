@@ -31,8 +31,19 @@ neither the names nor the values of `ADMIN_TOKEN`, `ADMIN_PASSWORD`,
 | `src/lib/api/types.ts` | TS mirror of `api/app/schemas/*.py` — update together |
 | `src/lib/api/client.ts` | Typed fetch wrapper; throws `ApiError{status, messages}` on non-2xx; re-checks the session before every call |
 | `src/lib/api/errors.ts` | FastAPI `detail` (string or Pydantic list) → readable lines |
-| `src/app/(panel)/review/` | Review queue: `page.tsx` (server, filters → API), `actions.ts` (Server Actions returning `ActionResult`), `ReviewQueue.tsx` (client) |
-| other `(panel)/*` | Placeholders for Dashboard, Generate, Health, Categories |
+| `src/lib/questionDraft.ts`, `src/components/QuestionPanes.tsx` | Question edit state → PATCH body, and the EN/ES read/edit panes (shared by Review and `/questions/[id]`) |
+| `src/lib/format.ts` | cents / percent / timestamps / job status colours |
+| `src/app/(panel)/page.tsx` | Dashboard: `/admin/health/summary` + recent jobs; month-to-date cost = sum of `cost_cents` over this month's jobs (newest 200) |
+| `src/app/(panel)/generate/` | Prompt → `POST /admin/generate/parse` → editable params → Confirm → `POST /admin/generate`; `JobList.tsx` polls a Server Action every 2 s while any job is queued/running |
+| `src/app/(panel)/review/` | Review queue: `page.tsx` (server, filters → API), `actions.ts` (Server Actions returning `ActionResult`), `ReviewQueue.tsx` (client). `?job=<id>` filters to one job |
+| `src/app/(panel)/health/` | Easy / Suspect / Dead tabs (`?view=`), Archive inline, Edit → `/questions/[id]` |
+| `src/app/(panel)/questions/[id]/` | Standalone editor for any question, whatever its status (not in the nav) |
+| `src/app/(panel)/categories/` | List, inline edit, create — both locales required on create |
+
+Every screen is a Server Component that fetches on the server; mutations are
+Server Actions in the screen's `actions.ts`, so the browser only ever POSTs
+to Next. Every Server Action returns `ActionResult` and the screens show
+422/409 detail inline.
 
 ## Review queue keys
 

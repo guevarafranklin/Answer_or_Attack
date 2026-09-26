@@ -1,11 +1,15 @@
 """Spec §4 — Generation:
 
+    POST   /admin/generate/parse        → {params, notes} for the admin to confirm
     POST   /admin/generate              → 202 {job_id}
     GET    /admin/generate/{job_id}     → job status + counts
     GET    /admin/generate              → recent jobs
 
-POST validates the structured §5.1 params, inserts the generation_jobs row,
-enqueues an arq job and returns. It never waits for the model.
+/parse is the one place free text meets a model synchronously: it returns
+the §5.1 params it read out of the prompt and creates nothing. POST
+validates the structured params the admin confirmed, inserts the
+generation_jobs row, enqueues an arq job and returns. It never waits for
+the model.
 """
 import uuid
 
@@ -18,14 +22,43 @@ from app.auth import require_admin
 from app.db import get_db
 from app.models import GenerationJob
 from app.queue import GENERATE_JOB, get_queue
-from app.schemas.generation import GenerationAccepted, GenerationJobRead, GenerationRequest
-from app.services.categories import get_category_by_slug
+from app.schemas.generation import (
+    GenerationAccepted,
+    GenerationJobRead,
+    GenerationRequest,
+    ParseRequest,
+    ParseResponse,
+)
+from app.services.categories import get_category_by_slug, list_categories
+from app.services.prompt_parser import ParseError, PromptParser
 
 router = APIRouter(
     prefix="/admin/generate",
     tags=["admin: generation"],
     dependencies=[Depends(require_admin)],
 )
+
+
+def get_prompt_parser() -> PromptParser:
+    """Dependency so tests can swap in a parser on a mocked transport."""
+    try:
+        return PromptParser.from_settings()
+    except ParseError as exc:
+        raise HTTPException(exc.status, detail=str(exc)) from exc
+
+
+@router.post("/parse", response_model=ParseResponse)
+async def parse_prompt(
+    payload: ParseRequest,
+    db: AsyncSession = Depends(get_db),
+    parser: PromptParser = Depends(get_prompt_parser),
+):
+    slugs = [c.slug for c in await list_categories(db) if c.is_active]
+    try:
+        parsed = await parser.parse(payload.prompt, slugs)
+    except ParseError as exc:
+        raise HTTPException(exc.status, detail=str(exc)) from exc
+    return ParseResponse(params=parsed.params, notes=parsed.notes)
 
 
 @router.post("", response_model=GenerationAccepted, status_code=status.HTTP_202_ACCEPTED)

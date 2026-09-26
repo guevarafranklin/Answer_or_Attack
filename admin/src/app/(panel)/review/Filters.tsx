@@ -7,7 +7,7 @@ import { DIFFICULTIES } from "@/lib/api/types";
 export interface ReviewFilters {
   category?: string; // slug
   difficulty?: number;
-  job_id?: string;
+  job?: string; // generation job id (the URL key jobs link with)
 }
 
 export function Filters({
@@ -65,8 +65,8 @@ export function Filters({
       </select>
       <select
         className={`${select} max-w-md`}
-        value={filters.job_id ?? ""}
-        onChange={(e) => update({ job_id: e.target.value })}
+        value={filters.job ?? ""}
+        onChange={(e) => update({ job: e.target.value })}
         aria-label="Generation job"
       >
         <option value="">All jobs</option>
@@ -78,7 +78,7 @@ export function Filters({
           </option>
         ))}
       </select>
-      {(filters.category || filters.difficulty || filters.job_id) && (
+      {(filters.category || filters.difficulty || filters.job) && (
         <button
           type="button"
           className="text-gray-500 underline"
