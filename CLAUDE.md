@@ -1,1 +1,2 @@
 - Never amend a migration after it has been committed or applied to the dev DB. Write a new migration instead.
+- Any request that mutates the dev API (POST/PATCH/DELETE against localhost:8000) counts as a dev DB write — ask first.

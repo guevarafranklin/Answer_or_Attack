@@ -1,36 +1,47 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Admin panel
 
-## Getting Started
+Next.js 16 (App Router, Tailwind) front end for the FastAPI content API. Every
+API call is made on the server — Server Components, Server Actions — with the
+admin bearer token; the browser only ever talks to Next.
 
-First, run the development server:
+## Run
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```sh
+# 1. API up (from api/): docker compose up -d, alembic upgrade head, uvicorn app.main:app
+# 2. Configure
+cp .env.example .env.local        # set ADMIN_TOKEN to the value in api/.env, pick ADMIN_PASSWORD
+# 3. Go
+npm install
+npm run dev                       # http://localhost:3000 → /login
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`npm run build` runs `scripts/check-client-secrets.mjs` before (source: no
+`NEXT_PUBLIC_` anywhere) and after (client bundles and prerendered payloads:
+neither the names nor the values of `ADMIN_TOKEN`, `ADMIN_PASSWORD`,
+`API_URL`). `src/lib/env.ts` and `src/lib/api/client.ts` also `import
+"server-only"`, so importing them from a client component is a compile error.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Layout
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Path | What |
+| --- | --- |
+| `src/proxy.ts` | Password gate: every route except `/login` needs a valid session cookie |
+| `src/lib/session.ts` | HMAC-signed httpOnly cookie (`aoa_admin_session`, 12 h); key = `ADMIN_PASSWORD` |
+| `src/lib/env.ts` | `API_URL`, `ADMIN_TOKEN`, `ADMIN_PASSWORD` — server only |
+| `src/lib/api/types.ts` | TS mirror of `api/app/schemas/*.py` — update together |
+| `src/lib/api/client.ts` | Typed fetch wrapper; throws `ApiError{status, messages}` on non-2xx; re-checks the session before every call |
+| `src/lib/api/errors.ts` | FastAPI `detail` (string or Pydantic list) → readable lines |
+| `src/app/(panel)/review/` | Review queue: `page.tsx` (server, filters → API), `actions.ts` (Server Actions returning `ActionResult`), `ReviewQueue.tsx` (client) |
+| other `(panel)/*` | Placeholders for Dashboard, Generate, Health, Categories |
 
-## Learn More
+## Review queue keys
 
-To learn more about Next.js, take a look at the following resources:
+| Key | Action |
+| --- | --- |
+| `A` / `R` | approve / reject current (advances automatically) |
+| `E` | edit inline; `1`–`4` set the correct option, `⌘/Ctrl+Enter` save, `Esc` cancel |
+| `J` / `K` (or arrows) | next / previous |
+| `B` | bulk-select mode; `X` or `Space` toggles the current question; with a selection, `A`/`R` apply to it |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+API refusals (422 validation, 409 duplicate stem / missing locale) show inline
+above the question; bulk failures are listed per id and stay in the queue.
