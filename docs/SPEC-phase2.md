@@ -69,7 +69,10 @@ LOBBY → [host starts] →
 - A token is earned on every `streak_for_token` consecutive correct answers (2nd, 4th, 6th…). Max held: `max_tokens`.
 - During ATTACK, a player with a token may target any other player. The attacker pays `attack_cost` immediately and loses the token. A player with 0 XP cannot attack (can't pay).
 - A target may receive at most `max_incoming_attacks` per window. Extra attacks are refused at declaration (first by server receive time wins), and the refused attacker keeps token and XP.
+- **"Can pay" means XP > 0.** The attacker pays `attack_cost` floored at 0. A holder at 0 XP is refused privately (`no_xp`); nobody else learns of it.
+- **The ATTACK window is skipped when no present player holds a token.** XP is not considered, so skipping never reveals who is broke. A token holder may `pass` instead of attacking; the window ends early once every present token holder has attacked or passed, and one attack *or* pass is allowed per window.
 - BLOCK: each attacked player gets one block question (difficulty 2–3), `block_seconds` to answer. Correct = all incoming attacks blocked. Wrong/timeout = target loses `attack_damage` per incoming attack (floored at 0). Block answers do not affect streaks or tokens.
+- **Block reserve exhausted:** the block question is drawn from the unused questions of the category pools (difficulty ≥ 2 preferred). Only when every pool is empty too do the attacks count as blocked.
 - Attackers see only whether the block succeeded, never the target's resulting total.
 
 ### 2.5 Amendments to the Phase 0 rules
@@ -83,10 +86,12 @@ LOBBY → [host starts] →
 - At END: everyone's starting XP, final total, and delta are revealed.
 
 ### 2.7 Winner and tiebreak
-Highest **final total** wins (the hidden start is the point of the game). Ties: higher delta → lower mean response time on correct answers → shared win. No sudden-death round in MVP.
+Highest **final total** wins (the hidden start is the point of the game). Ties: higher delta → lower mean response time on correct answers (round questions only, never blocks; a player with no correct answer loses this step) → shared win. No sudden-death round in MVP.
 
 ### 2.8 Presence
 - Disconnect marks a player **absent**. They keep their seat and XP for `rejoin_seconds`, rejoining with their `player_token`. After that they're dropped from the turn order but remain in final results.
+- **Absence only protects round answers** (§2.3). An attacked player who is absent at the block deadline times out and takes damage like anyone else.
+- **Dropped players** are served no more questions and cannot be targeted (`unknown_target`), but keep their XP and appear in the END reveal.
 - If the picker is absent at PICK, the pick passes to the next present player.
 - If the host disconnects, host passes to the longest-connected present player.
 - If fewer than 2 players are present for 60s, the session ends as `abandoned`.
@@ -130,6 +135,7 @@ All messages are JSON `{ "type": ..., ... }`. Server times are epoch millisecond
 | `pick` | `category_id` | picker, in PICK |
 | `answer` | `question_id`, `option` (0–3) | QUESTION or BLOCK |
 | `attack` | `target_player_id` | ATTACK, token holders |
+| `pass` | | ATTACK, token holders who decline to attack |
 | `report` | `question_id`, `reason` | anytime after the question is shown |
 
 ### Server → client
