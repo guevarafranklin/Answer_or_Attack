@@ -32,6 +32,7 @@ from app.rules import (
     OPTION_COUNT,
     RuleViolation,
     contains_forbidden_phrase,
+    validate_answer_not_in_stem,
     validate_options,
     validate_stem,
 )
@@ -46,6 +47,7 @@ STEM_INVALID = "stem_invalid"  # :locale  (missing or not a string)
 OPTIONS_INVALID = "options_invalid"  # :locale  (not a list of strings)
 EXPLANATION_INVALID = "explanation_invalid"  # :locale
 FORBIDDEN_PHRASE = "forbidden_phrase"  # :locale
+ANSWER_IN_STEM = "answer_in_stem"  # :locale  (§5.3: the stem gives the answer away)
 CORRECT_INDEX_INVALID = "correct_index_invalid"
 DIFFICULTY_INVALID = "difficulty_invalid"
 GRADE_BAND_INVALID = "grade_band_invalid"
@@ -145,6 +147,13 @@ def validate_item(raw: Any) -> CleanItem | Rejections:
     correct_index = raw.get("correct_index")
     if not _is_int(correct_index) or not 0 <= correct_index < OPTION_COUNT:
         reasons.append(CORRECT_INDEX_INVALID)
+    else:
+        for locale, clean in translations.items():
+            if correct_index < len(clean.options):
+                try:
+                    validate_answer_not_in_stem(clean.stem, clean.options[correct_index])
+                except RuleViolation as exc:
+                    reasons.append(f"{exc.code}:{locale}")
 
     difficulty = raw.get("difficulty")
     if not _is_int(difficulty) or not MIN_DIFFICULTY <= difficulty <= MAX_DIFFICULTY:

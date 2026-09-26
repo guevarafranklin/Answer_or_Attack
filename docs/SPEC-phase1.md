@@ -351,6 +351,11 @@ POST   /admin/questions/{id}/archive     → status='archived'
 POST   /admin/questions/bulk             {ids:[], action:'approve'|'reject'|'archive'}
 ```
 
+- The list covers house content only (`pack_id IS NULL`), newest first, and returns `{items, page, page_size, total}` (`page_size` 1–200, default 50). `category` is a slug; `locale` keeps only questions that have text in that locale. Any question, pack or house, is still reachable by id.
+- `PATCH` merges per locale (a locale that is sent is replaced, one that is omitted is kept) and runs the text through the same `app/rules.py` limits the generator's validator uses — stem ≤120, exactly 4 distinct non-empty options ≤60, no "all/none of the above" — so a bad edit is a 422 and nothing is written. Editing the `en` stem re-derives `content_hash`; a collision with another house question is a 409.
+- `approve` refuses (409) a question that lacks either locale: the game serves both. `approve` and `reject` stamp `reviewed_at` and set `reviewed_by` to `ADMIN_USER_ID` (a `users.id`; unset leaves it NULL until Phase 4 auth identifies the reviewer). `archive` retires a question without touching the review stamp. Repeating an action a question is already in is a no-op, not a re-stamp.
+- `bulk` applies the action to each id independently and returns `{updated: [ids], failed: [{id, detail}]}` — an unknown id or an unapprovable question never blocks the rest.
+
 ### Health views
 Three saved queries against `question_stats`, all with a `serves >= 50` floor:
 ```

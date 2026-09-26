@@ -128,8 +128,13 @@ def _options_with_answer(i: int, answer: str) -> list[str]:
 
 _DROP = object()
 
+
+def _answer(raw: dict[str, Any]) -> str:
+    return raw["en"]["options"][raw["correct_index"]]
+
 # (path, value) edits applied to a valid item, one per rejection rule in
-# app.services.validation. Paths use "__" to descend into a locale.
+# app.services.validation. Paths use "__" to descend into a locale; a callable
+# value is computed from the item it is applied to.
 _BAD_VARIANTS: list[dict[str, Any]] = [
     {"es": _DROP},                                                      # missing_locale:es
     {"es": "no es un objeto"},                                          # locale_not_object:es
@@ -148,6 +153,7 @@ _BAD_VARIANTS: list[dict[str, Any]] = [
     {"difficulty": 0},                                                  # difficulty_invalid
     {"grade_band": "g13"},                                              # grade_band_invalid
     {"tags": "not-a-list"},                                             # tags_invalid
+    {"en__stem": lambda raw: f"Is it {_answer(raw)}?"},                 # answer_in_stem:en
 ]
 
 
@@ -165,7 +171,7 @@ def _bad_items(params: GenerationParams) -> list[Any]:
             if value is _DROP:
                 target.pop(leaf, None)
             else:
-                target[leaf] = value
+                target[leaf] = value(raw) if callable(value) else value
         items.append(raw)
     return items
 
@@ -173,7 +179,7 @@ def _bad_items(params: GenerationParams) -> list[Any]:
 def _mixed_items(params: GenerationParams) -> list[Any]:
     """The stub's opening batch: one good item, a duplicate of it, and one
     bad item per rejection rule."""
-    first = _good(0, params)
+    first = _good(1, params)  # not 0: "what is 0 + 0?" would contain its answer
     return [first, copy.deepcopy(first), *_bad_items(params)]  # second is duplicate_in_batch
 
 

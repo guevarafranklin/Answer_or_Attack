@@ -1,3 +1,5 @@
+import uuid
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +10,10 @@ class Settings(BaseSettings):
     # Bearer token for /admin/* (spec §4: simple token now, real auth in Phase 4).
     # Empty means admin routes reject everything — there is no default secret.
     admin_token: str = ""
+    # users.id written to questions.reviewed_by on approve/reject. The shared
+    # token identifies nobody, so this is the one reviewer until Phase 4;
+    # unset leaves reviewed_by NULL (reviewed_at is stamped either way).
+    admin_user_id: uuid.UUID | None = None
     # Which Generator the worker uses: "stub" (fixed items, no network) or
     # "claude" (app.services.claude_generator). Defaults to the stub so
     # nothing calls a model by accident.

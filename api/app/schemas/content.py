@@ -3,10 +3,16 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models._common import LOCALES
-from app.rules import OPTION_COUNT, validate_options, validate_stem
+from app.rules import (
+    OPTION_COUNT,
+    RuleViolation,
+    contains_forbidden_phrase,
+    validate_options,
+    validate_stem,
+)
 from app.schemas.common import (
     GradeBand,
     Locale,
@@ -102,6 +108,14 @@ class QuestionTranslationIn(BaseModel):
     _check_stem = field_validator("stem")(validate_stem)
     _check_options = field_validator("options")(validate_options)
 
+    @model_validator(mode="after")
+    def _no_forbidden_phrase(self) -> "QuestionTranslationIn":
+        if any(contains_forbidden_phrase(t) for t in (self.stem, *self.options)):
+            raise RuleViolation(
+                "forbidden_phrase", "stem and options must not say 'all/none of the above'"
+            )
+        return self
+
 
 class QuestionTranslationRead(ORMModel):
     locale: Locale
@@ -146,13 +160,33 @@ class QuestionListQuery(BaseModel):
 
     status: QuestionStatus | None = None
     category: str | None = None  # slug
-    locale: Locale | None = None
+    locale: Locale | None = None  # only questions that have text in this locale
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=200)
+
+
+class QuestionPage(BaseModel):
+    items: list[QuestionRead]
+    page: int
+    page_size: int
+    total: int
 
 
 class QuestionBulkAction(BaseModel):
     """POST /admin/questions/bulk {ids:[], action}"""
 
-    ids: list[uuid.UUID] = Field(min_length=1)
+    ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
     action: BulkAction
+
+
+class QuestionBulkFailure(BaseModel):
+    id: uuid.UUID
+    detail: str
+
+
+class QuestionBulkResult(BaseModel):
+    """Per-id outcome: the ids that changed and, for the rest, why not.
+    A bulk call succeeds as a whole even if some ids fail."""
+
+    updated: list[uuid.UUID]
+    failed: list[QuestionBulkFailure]
