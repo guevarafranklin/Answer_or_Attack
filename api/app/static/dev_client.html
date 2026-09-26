@@ -28,6 +28,7 @@
   .box { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: .8rem; margin: .6rem 0; }
   .muted { color: #666; font-size: .9rem; }
   .err { color: #b91c1c; }
+  .fatal { background: #b91c1c; color: #fff; padding: .6rem .8rem; font-weight: 600; white-space: pre-wrap; }
   .ok { color: #15803d; }
   .big { font-size: 1.4rem; font-weight: 600; }
   .countdown { font-size: 2.2rem; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
@@ -51,12 +52,30 @@
 </style>
 </head>
 <body>
+<!-- Anything that goes wrong shows up here, in red, at the top of the page:
+     an uncaught exception, an unhandled promise, even a syntax error in the
+     main script below (this one is separate so it is already installed). -->
+<div id="fatal" class="fatal" hidden></div>
+<script>
+  window.addEventListener('error', e => fatal(e.message + (e.filename ? ` (line ${e.lineno})` : '')));
+  window.addEventListener('unhandledrejection', e => fatal('unhandled: ' + (e.reason && e.reason.message || e.reason)));
+  function fatal(text) {
+    const el = document.getElementById('fatal');
+    el.hidden = false;
+    el.textContent = 'Page error: ' + text;
+  }
+</script>
 <main>
   <h1>Answer or Attack <span class="muted">dev client</span></h1>
 
-  <section id="home">
+  <!-- One name field for both the join and the create screen: it stays put
+       whichever way the player goes, so Create never finds it empty. -->
+  <div id="who">
     <label for="name">Your name</label>
     <input type="text" id="name" maxlength="40" autocomplete="off" autocapitalize="words">
+  </div>
+
+  <section id="home">
     <label for="joincode">Join code</label>
     <input type="text" id="joincode" maxlength="6" autocomplete="off" autocapitalize="characters" style="font-family:ui-monospace,monospace;font-size:1.6rem;letter-spacing:.2em;text-transform:uppercase">
     <button class="primary" id="btn-join">Join game</button>
@@ -72,7 +91,7 @@
     <label>Categories</label>
     <div class="cats box" id="cats"><span class="muted">loading…</span></div>
     <label for="overrides">Config overrides (JSON, optional)</label>
-    <textarea id="overrides" placeholder='{"question_count": 6, "min_players": 2}'>{}</textarea>
+    <textarea id="overrides" placeholder='{"question_count": 6, "min_players": 2}' autocorrect="off" autocapitalize="off" spellcheck="false">{}</textarea>
     <button class="primary" id="btn-create">Create game</button>
     <button id="btn-back">Back</button>
     <p id="create-msg" class="err"></p>
@@ -100,6 +119,7 @@
   <span>conn <span id="d-conn" class="state-closed">closed</span></span>
   <span>rtt <span id="d-rtt">–</span></span>
   <span>offset <span id="d-off">–</span></span>
+  <span>http <span id="d-http">–</span></span>
   <label style="display:inline;margin:0;color:#ddd">lag <select id="lagsim">
     <option value="0">0 ms</option>
     <option value="150">150±50 ms</option>
@@ -126,11 +146,34 @@ const store = {
 async function api(method, path, body, userId) {
   const headers = { 'Content-Type': 'application/json' };
   if (userId) headers['X-User-Id'] = userId;
-  const r = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const http = $('d-http');
+  http.textContent = `${method} ${path} …`;
+  let r;
+  try {
+    r = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  } catch (e) {
+    http.textContent = `${method} ${path} failed`;
+    throw new Error(`${method} ${path}: no response (${e.message})`);
+  }
+  http.textContent = `${method} ${path} ${r.status}`;
   const text = await r.text();
   let data; try { data = JSON.parse(text); } catch { data = text; }
   if (!r.ok) throw new Error(`${r.status} ${typeof data === 'object' && data.detail ? JSON.stringify(data.detail) : data}`);
   return data;
+}
+
+// Click handlers for the two screens: the button is disabled while the
+// requests run, and whatever fails — validation, HTTP, a bug in the handler
+// itself — ends up as text in the screen's message line, never swallowed.
+function guarded(buttonId, msgId, fn) {
+  const btn = $(buttonId), msg = $(msgId);
+  btn.onclick = async () => {
+    msg.textContent = '';
+    btn.disabled = true;
+    try { await fn(msg); }
+    catch (e) { msg.textContent = String(e && e.message || e); }
+    finally { btn.disabled = false; }
+  };
 }
 
 async function ensureUser(name) {
@@ -175,16 +218,21 @@ const playerName = id => { const p = G.players.find(p => p.player_id === id); re
 const catName = id => { const c = G.cats[id]; return c ? (c.names[G.locale] || c.names.en || c.slug) : id.slice(0, 8); };
 
 async function loadCats() {
-  try { for (const c of await api('GET', '/dev/categories')) G.cats[c.id] = c; } catch (e) { log('categories: ' + e.message); }
+  try { for (const c of await api('GET', '/dev/categories')) G.cats[c.id] = c; }
+  catch (e) { log('categories: ' + e.message); throw new Error('Could not load categories: ' + e.message); }
 }
 
 // ---------- screens ----------
-function show(id) { for (const s of ['home', 'create', 'game']) $(s).hidden = s !== id; window.scrollTo(0, 0); }
+function show(id) {
+  for (const s of ['home', 'create', 'game']) $(s).hidden = s !== id;
+  $('who').hidden = id === 'game';
+  window.scrollTo(0, 0);
+}
 
 $('btn-to-create').onclick = async () => {
   $('create-msg').textContent = '';
   show('create');
-  await loadCats();
+  try { await loadCats(); } catch (e) { $('cats').innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
   renderCats();
 };
 $('locale').onchange = () => { G.locale = $('locale').value; renderCats(); };
@@ -199,37 +247,37 @@ function renderCats() {
     `<label><input type="checkbox" value="${c.id}" ${checked.has(c.id) ? 'checked' : ''}> ${esc(c.icon || '')} ${esc(catName(c.id))}</label>`).join('');
 }
 
-$('btn-create').onclick = async () => {
-  const msg = $('create-msg'); msg.textContent = '';
+guarded('btn-create', 'create-msg', async msg => {
   const name = $('name').value.trim();
-  if (!name) { msg.textContent = 'Type your name on the first screen.'; show('home'); return; }
+  if (!name) { msg.textContent = 'Type your name first.'; $('name').focus(); return; }
+  // Phone keyboards turn " into “ ” — undo that before parsing.
+  const raw = ($('overrides').value || '{}').replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
   let overrides;
-  try { overrides = JSON.parse($('overrides').value || '{}'); } catch (e) { msg.textContent = 'Overrides are not valid JSON: ' + e.message; return; }
+  try { overrides = JSON.parse(raw.trim() || '{}'); } catch (e) { throw new Error('Overrides are not valid JSON: ' + e.message); }
   const category_ids = [...document.querySelectorAll('#cats input:checked')].map(i => i.value);
   if (!category_ids.length) { msg.textContent = 'Pick at least one category.'; return; }
-  try {
-    const user = await ensureUser(name);
-    const locale = $('locale').value;
-    const created = await api('POST', '/sessions', { category_ids, locale, config_overrides: overrides }, user.user_id);
-    const seat = await api('POST', `/sessions/${created.join_code}/join`, { display_name: name }, user.user_id);
-    store.seat = { join_code: created.join_code, player_id: seat.player_id, player_token: seat.player_token, locale };
-    G.locale = locale;
-    enterGame();
-  } catch (e) { msg.textContent = e.message; }
-};
+  msg.textContent = 'Creating…';
+  const user = await ensureUser(name);
+  const locale = $('locale').value;
+  const created = await api('POST', '/sessions', { category_ids, locale, config_overrides: overrides }, user.user_id);
+  const seat = await api('POST', `/sessions/${created.join_code}/join`, { display_name: name }, user.user_id);
+  store.seat = { join_code: created.join_code, player_id: seat.player_id, player_token: seat.player_token, locale };
+  G.locale = locale;
+  await enterGame();
+  msg.textContent = '';
+});
 
-$('btn-join').onclick = async () => {
-  const msg = $('home-msg'); msg.textContent = '';
+guarded('btn-join', 'home-msg', async msg => {
   const name = $('name').value.trim();
   const code = $('joincode').value.trim().toUpperCase();
   if (!name || !code) { msg.textContent = 'Name and join code, please.'; return; }
-  try {
-    const user = await ensureUser(name);
-    const seat = await api('POST', `/sessions/${code}/join`, { display_name: name }, user.user_id);
-    store.seat = { join_code: code, player_id: seat.player_id, player_token: seat.player_token, locale: G.locale };
-    enterGame();
-  } catch (e) { msg.textContent = e.message; }
-};
+  msg.textContent = 'Joining…';
+  const user = await ensureUser(name);
+  const seat = await api('POST', `/sessions/${code}/join`, { display_name: name }, user.user_id);
+  store.seat = { join_code: code, player_id: seat.player_id, player_token: seat.player_token, locale: G.locale };
+  await enterGame();
+  msg.textContent = '';
+});
 
 $('btn-leave').onclick = () => { leave(''); };
 
@@ -244,7 +292,9 @@ function leave(reason) {
 async function enterGame() {
   const seat = store.seat;
   G.locale = seat.locale || G.locale;
-  if (!Object.keys(G.cats).length) await loadCats();
+  // Names on the board are nicer with categories loaded, but a game can be
+  // rejoined without them (loadCats has already logged the failure).
+  if (!Object.keys(G.cats).length) { try { await loadCats(); } catch {} }
   $('g-code').textContent = seat.join_code;
   $('lobby-code').textContent = seat.join_code;
   $('log').textContent = '';
