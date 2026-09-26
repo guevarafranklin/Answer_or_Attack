@@ -13,7 +13,14 @@ class Settings(BaseSettings):
     # users.id written to questions.reviewed_by on approve/reject. The shared
     # token identifies nobody, so this is the one reviewer until Phase 4;
     # unset leaves reviewed_by NULL (reviewed_at is stamped either way).
+    # When set, startup verifies the row exists with role 'admin'
+    # (app.auth.verify_admin_user) and refuses to boot otherwise.
     admin_user_id: uuid.UUID | None = None
+    # Stats rollup (§3.1): the worker folds new question_serves rows into
+    # question_stats on this cron interval, this many serve ids per
+    # transaction (see app.services.stats.rollup_batch).
+    stats_rollup_interval_minutes: int = 5
+    stats_rollup_batch_size: int = 10_000
     # Which Generator the worker uses: "stub" (fixed items, no network) or
     # "claude" (app.services.claude_generator). Defaults to the stub so
     # nothing calls a model by accident.

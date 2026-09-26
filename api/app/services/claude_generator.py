@@ -63,6 +63,7 @@ Hard rules — a question that breaks any of these is thrown away:
 - Stem at most {MAX_STEM_LEN} characters.
 - explanation: one sentence, at most {MAX_EXPLANATION_LEN} characters, in each locale. Say why the answer is right; nothing more.
 - Never use {", ".join(f'"{p}"' for p in FORBIDDEN_PHRASES)} or anything like them.
+- Never list the answer choices inside the stem; the options are shown separately.
 - No questions whose answer changes over time ("the current president") unless the question's tags include "time_sensitive".
 - correct_index is the 0-based position of the correct option. Vary it; do not put the answer in the same position every time.
 - Keep the options in the same order in both locales, so correct_index applies to both.

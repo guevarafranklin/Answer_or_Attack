@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.db import constraint_name
 from app.models import Category, Question, QuestionTranslation
 from app.models._common import LOCALES
 from app.schemas.content import (
@@ -142,7 +143,7 @@ async def update_question(db: AsyncSession, question: Question, data: QuestionUp
                 except RuleViolation as exc:
                     raise InvalidEdit(exc.code, t.locale, str(exc)) from exc
     except IntegrityError as exc:
-        if _constraint_name(exc) == "questions_house_hash_uniq":
+        if constraint_name(exc) == "questions_house_hash_uniq":
             raise DuplicateQuestion() from exc
         raise
     await db.refresh(question, attribute_names=["updated_at"])  # onupdate=now() ran server-side
@@ -211,8 +212,3 @@ async def apply_bulk(
             updated.append(question_id)
     await db.flush()
     return updated, failed
-
-
-def _constraint_name(exc: IntegrityError) -> str | None:
-    diag = getattr(exc.orig, "diag", None)
-    return getattr(diag, "constraint_name", None)

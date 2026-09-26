@@ -18,6 +18,8 @@ from app.services.validation import content_hash
 
 ABCD = ["a", "b", "c", "d"]
 TWO_FIVE = ["2", "3", "4", "5"]
+PLANETS = ["Mars", "Venus", "Jupiter", "Saturn"]
+PLANETAS = ["Marte", "Venus", "Júpiter", "Saturno"]
 ES_EDIT = {"stem": "¿Cuánto es 1 + 1?", "options": TWO_FIVE}
 
 
@@ -340,11 +342,11 @@ async def test_patch_rejects_rule_violations(
 @pytest.mark.parametrize(
     "payload, locale",
     [
-        # New stem gives the stored answer ("2") away.
-        ({"translations": {"en": {"stem": "Is 2 what 1 + 1 makes?", "options": TWO_FIVE}}}, "en"),
-        ({"translations": {"es": {"stem": "¿Es 2 lo que da 1 + 1?", "options": TWO_FIVE}}}, "es"),
-        # Only the answer key moves, onto an option the stored stem contains ("1").
-        ({"correct_index": 1}, "en"),
+        # New stem gives the stored answer (index 0, "Mars") away.
+        ({"translations": {"en": {"stem": "Which planet is Mars?", "options": PLANETS}}}, "en"),
+        ({"translations": {"es": {"stem": "¿Qué planeta es Marte?", "options": PLANETAS}}}, "es"),
+        # Only the answer key moves, onto an option the stored stem contains.
+        ({"correct_index": 3}, "en"),
     ],
 )
 async def test_patch_rejects_answer_in_stem_on_the_merged_question(
@@ -354,10 +356,9 @@ async def test_patch_rejects_answer_in_stem_on_the_merged_question(
     the question as it would be after the edit, whichever part changed."""
     cat = await _category(db)
     q = await _question(db, cat, 1)
-    if "correct_index" in payload:
-        # en options ["2", "1", "4", "5"]: index 1 is "1", which the stem contains.
-        next(t for t in q.translations if t.locale == "en").options = ["2", "1", "4", "5"]
-        await db.flush()
+    en = next(t for t in q.translations if t.locale == "en")
+    en.stem, en.options = "Which planet is next to Saturn?", PLANETS  # answer: Mars
+    await db.flush()
     q_id = q.id
 
     resp = await client.patch(f"/admin/questions/{q_id}", json=payload, headers=admin_headers)
@@ -365,7 +366,7 @@ async def test_patch_rejects_answer_in_stem_on_the_merged_question(
     assert f"answer_in_stem:{locale}" in resp.json()["detail"]
     fresh = await _fresh(db, q_id)
     assert fresh.correct_index == 0
-    assert {t.locale: t.stem for t in fresh.translations}["en"] == "Question 1: what is 1 + 1?"
+    assert {t.locale: t.stem for t in fresh.translations}["en"] == "Which planet is next to Saturn?"
 
 
 @pytest.mark.asyncio

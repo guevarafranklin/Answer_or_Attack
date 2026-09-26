@@ -64,8 +64,10 @@ def contains_forbidden_phrase(text: str) -> bool:
 
 
 # §5.3 "No answer in the stem". A word of the correct answer counts as
-# distinctive when it is this long and not a function word / question word
-# that any stem might contain ("Which city..." vs "Mexico City").
+# distinctive when it has letters, is this long, and is not a function word
+# / question word that any stem might contain ("Which city..." vs "Mexico
+# City"). Numbers are never distinctive: a year or a fraction in the stem is
+# how math and comparison questions name their options.
 MIN_DISTINCTIVE_WORD_LEN = 4
 NON_DISTINCTIVE_WORDS = frozenset(
     {
@@ -92,23 +94,24 @@ def _normalize_words(text: str) -> list[str]:
     return re.findall(r"[0-9a-z]+", stripped.lower())
 
 
+def _is_distinctive(word: str) -> bool:
+    return (
+        len(word) >= MIN_DISTINCTIVE_WORD_LEN
+        and word not in NON_DISTINCTIVE_WORDS
+        and any(ch.isalpha() for ch in word)
+    )
+
+
 def validate_answer_not_in_stem(stem: str, answer: str) -> None:
     """Raise RuleViolation('answer_in_stem') if the stem gives the answer
-    away: the whole answer appears in it as a phrase, or any distinctive
-    word of the answer (see MIN_DISTINCTIVE_WORD_LEN / NON_DISTINCTIVE_WORDS)
-    appears in it as a word. Compared case- and accent-insensitively."""
-    stem_words = _normalize_words(stem)
-    answer_words = _normalize_words(answer)
-    if not answer_words:
-        return
-    n = len(answer_words)
-    phrase_in_stem = any(
-        stem_words[i : i + n] == answer_words for i in range(len(stem_words) - n + 1)
-    )
-    distinctive = {
-        w
-        for w in answer_words
-        if len(w) >= MIN_DISTINCTIVE_WORD_LEN and w not in NON_DISTINCTIVE_WORDS
-    }
-    if phrase_in_stem or distinctive & set(stem_words):
+    away: a distinctive word of the correct answer (see
+    MIN_DISTINCTIVE_WORD_LEN / NON_DISTINCTIVE_WORDS) appears in the stem as
+    a word, compared case- and accent-insensitively.
+
+    An answer with no distinctive word — a number, a year, a fraction, a
+    short word — is never a giveaway: "Which is larger: 3/4 or 2/3?" has to
+    name its options in the stem. (A whole-phrase match is implied: if the
+    whole answer is in the stem, so is each of its distinctive words.)"""
+    distinctive = {w for w in _normalize_words(answer) if _is_distinctive(w)}
+    if distinctive & set(_normalize_words(stem)):
         raise RuleViolation("answer_in_stem", "the stem must not contain the correct answer")

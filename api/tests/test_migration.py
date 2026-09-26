@@ -22,6 +22,7 @@ EXPECTED_TABLES = {
     "question_serves",
     "question_stats",
     "question_reports",
+    "rollup_watermarks",
     "sessions",
     "session_players",
     "session_questions",

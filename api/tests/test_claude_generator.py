@@ -160,6 +160,7 @@ def test_system_prompt_editorial_guidance():
     """§5.3 plus the rules from the first real batch review."""
     system = cg.SYSTEM_PROMPT
     assert "Exactly one defensible correct answer" in system
+    assert "Never list the answer choices inside the stem; the options are shown separately." in system
 
     # Difficulty rubric: anchored levels, judged by how many adults know it.
     assert "judge by how many adults would answer correctly, not by how important the topic is" in system

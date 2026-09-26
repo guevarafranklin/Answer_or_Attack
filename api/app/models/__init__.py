@@ -13,7 +13,7 @@ from app.models.content import (
 )
 from app.models.generation import GenerationJob
 from app.models.sessions import GameSession, SessionPlayer, SessionQuestion
-from app.models.telemetry import QuestionReport, QuestionServe, QuestionStats
+from app.models.telemetry import QuestionReport, QuestionServe, QuestionStats, RollupWatermark
 from app.models.users import Subscription, TicketLedgerEntry, User
 
 __all__ = [
@@ -27,6 +27,7 @@ __all__ = [
     "QuestionServe",
     "QuestionStats",
     "QuestionTranslation",
+    "RollupWatermark",
     "SessionPlayer",
     "SessionQuestion",
     "StudyPack",

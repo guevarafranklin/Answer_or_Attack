@@ -154,23 +154,31 @@ def test_forbidden_phrase(locale, where, value):
     assert reasons(item(**{f"{locale}.{where}": value})) == [f"forbidden_phrase:{locale}"]
 
 
+PLANETS = ["Mars", "Venus", "Jupiter", "Saturn"]  # GOOD's correct_index 2 → Jupiter
+
+
 @pytest.mark.parametrize(
     "locale, stem",
     [
-        ("en", "Is 4 the answer to 2 + 2?"),  # whole answer as a word
-        ("es", "¿Es 4 la respuesta a 2 + 2?"),
+        ("en", "Which planet is Jupiter?"),
+        ("es", "¿Qué planeta es Júpiter?"),  # accent-insensitive
     ],
 )
 def test_answer_in_stem(locale, stem):
-    assert reasons(item(**{f"{locale}.stem": stem})) == [f"answer_in_stem:{locale}"]
+    raw = item(**{f"{locale}.stem": stem, f"{locale}.options": PLANETS})
+    assert reasons(raw) == [f"answer_in_stem:{locale}"]
 
 
 def test_answer_in_stem_checks_the_correct_option_only():
-    """"22" is a distractor here; only the correct option is a giveaway."""
-    assert isinstance(validate_item(item(**{"en.stem": "Is 22 what 2 + 2 makes?"})), CleanItem)
-    assert reasons(item(correct_index=3, **{"en.stem": "Is 22 what 2 + 2 makes?"})) == [
-        "answer_in_stem:en"
-    ]
+    """Saturn is a distractor here; only the correct option is a giveaway."""
+    saturn = {"en.stem": "Which planet is next to Saturn?", "en.options": PLANETS}
+    assert isinstance(validate_item(item(**saturn)), CleanItem)
+    assert reasons(item(correct_index=3, **saturn)) == ["answer_in_stem:en"]
+
+
+def test_answer_in_stem_ignores_numeric_answers():
+    """GOOD's answer is "4"; a stem that spells out the sum is fine."""
+    assert isinstance(validate_item(item(**{"en.stem": "Is 4 what 2 + 2 makes?"})), CleanItem)
 
 
 def test_answer_in_stem_is_reported_per_locale_with_distinctive_words():

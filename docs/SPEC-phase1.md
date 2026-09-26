@@ -232,7 +232,19 @@ CREATE TABLE question_stats (
   timeouts        INT NOT NULL DEFAULT 0,
   reports         INT NOT NULL DEFAULT 0,
   avg_response_ms INT,
-  last_served_at  TIMESTAMPTZ
+  last_served_at  TIMESTAMPTZ,
+  absents          INT NOT NULL DEFAULT 0,    -- 'absent' serves, kept out of serves (migration 0003)
+  timed_serves     INT NOT NULL DEFAULT 0,    -- serves with a response_ms (migration 0003)
+  response_ms_total BIGINT NOT NULL DEFAULT 0 -- so avg_response_ms advances incrementally
+);
+
+-- High-water marks for incremental rollups (migration 0003). One row per
+-- rollup; Phase 1 has 'question_serves' = the last question_serves.id folded
+-- into question_stats.
+CREATE TABLE rollup_watermarks (
+  name       TEXT PRIMARY KEY,
+  last_id    BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE question_reports (
@@ -290,6 +302,8 @@ CREATE TABLE session_questions (
 
 - `content_hash` is `sha256(lower(trim(en_stem)) with internal whitespace collapsed)`. Compute in the service layer before insert; the partial unique index enforces it for house content only.
 - `question_stats` is updated by the worker in batches from `question_serves`, not on every write. A serve is a hot path; a stat rollup is not.
+- Serve ingestion is a service function, `app.services.serves.record_serves(db, [QuestionServeCreate, ...])`, with no HTTP endpoint: the Phase 2 game engine calls it in-process. It bulk-inserts the rows and never touches `question_stats`; an unknown `question_id` raises `UnknownQuestion`.
+- The rollup (`app.services.stats.rollup_batch`, run by the arq cron `rollup_question_stats` every `STATS_ROLLUP_INTERVAL_MINUTES`, default 5) is incremental: it folds the serves with `id` in `(watermark, upper]` into `question_stats` with one `INSERT … ON CONFLICT DO UPDATE` that adds counts, then advances `rollup_watermarks.last_id`. `upper` is at most `STATS_ROLLUP_BATCH_SIZE` (default 10 000) rows past the mark and never newer than `now() - 5s`, so a serve whose transaction commits after a lower id is never skipped. The watermark row is `SELECT … FOR UPDATE`, so two runs cannot fold the same rows. A run repeats batches until it is caught up (or 100 batches). `serves = correct + incorrect + timeouts`: an `absent` serve (the question was shown but the player was gone) says nothing about the question, so it goes to `absents` and never dilutes a health ratio or counts toward the `serves >= 50` floor (it still moves `last_served_at`); `avg_response_ms` is `response_ms_total / timed_serves`; `last_served_at` only moves forward; `reports` belongs to the report endpoint and is never touched by the rollup.
 - `session_players.starting_xp` is written at session start and **never sent to clients** until the reveal. Guard this in the serializer, not just by convention.
 
 ---
@@ -353,7 +367,7 @@ POST   /admin/questions/bulk             {ids:[], action:'approve'|'reject'|'arc
 
 - The list covers house content only (`pack_id IS NULL`), newest first, and returns `{items, page, page_size, total}` (`page_size` 1–200, default 50). Filters combine with AND: `status`, `category` (slug), `locale` (only questions that have text in that locale), `difficulty` (1–5), `job_id` (`generation_job_id`, to review one batch). Any question, pack or house, is still reachable by id.
 - `PATCH` merges per locale (a locale that is sent is replaced, one that is omitted is kept) and runs the result through the same `app/rules.py` rules the generator's validator uses — stem ≤120, exactly 4 distinct non-empty options ≤60, no "all/none of the above", and no answer in the stem (checked on the merged question, so moving `correct_index` onto an option the stem contains fails too) — so a bad edit is a 422 and nothing is written. Editing the `en` stem re-derives `content_hash`; a collision with another house question is a 409.
-- `approve` refuses (409) a question that lacks either locale: the game serves both. `approve` and `reject` stamp `reviewed_at` and set `reviewed_by` to `ADMIN_USER_ID` (a `users.id`; unset leaves it NULL until Phase 4 auth identifies the reviewer). `archive` retires a question without touching the review stamp. Repeating an action a question is already in is a no-op, not a re-stamp.
+- `approve` refuses (409) a question that lacks either locale: the game serves both. `approve` and `reject` stamp `reviewed_at` and set `reviewed_by` to `ADMIN_USER_ID` (a `users.id`; unset leaves it NULL until Phase 4 auth identifies the reviewer). When `ADMIN_USER_ID` is set, the API verifies at startup that the row exists with `role='admin'` and refuses to boot otherwise. `archive` retires a question without touching the review stamp. Repeating an action a question is already in is a no-op, not a re-stamp.
 - `bulk` applies the action to each id independently and returns `{updated: [ids], failed: [{id, detail}]}` — an unknown id or an unapprovable question never blocks the rest.
 
 ### Health views
@@ -365,6 +379,11 @@ GET /admin/health/dead       timeouts/serves > 0.60
 GET /admin/health/summary    counts by category/status/locale, pending backlog
 ```
 Interpretation for the UI copy: a **suspect** question usually has a wrong answer key, not a hard question. A **dead** question is usually too long to read in 10 seconds, not too difficult.
+
+- Every health query reads `question_stats` only — never `question_serves`. Serves that the rollup has not folded yet are invisible until the next cron run.
+- The three views return `{view, items, page, page_size, total}` (`page_size` 1–200, default 50). Each item is the `question_stats` row plus `ratio` (the view's ratio: correct/serves for easy and suspect, timeouts/serves for dead) and `question` (the full question with both translations, so the row can link to the edit view). `easy` and `dead` order by ratio descending, `suspect` ascending (worst key first); ties break on `question_id`. Any status is shown — an archived question with bad stats is still worth seeing. An unknown view is a 422.
+- `summary` covers house content (`pack_id IS NULL`, like the review queue): `{pending_backlog, by_status, by_category: [{slug, counts}], by_locale: {en: counts, es: counts}, health: {easy, suspect, dead}}`, where `counts` is `{pending, live, archived, rejected}`, `by_locale` counts questions that have text in that locale, and `health` is the row count of each view.
+- `scripts/synthetic_serves.py` writes realistic serve data (archetypes: normal, easy, wrong key, reported, dead, unproven under the floor) to the **test** database only and rolls it up, so the views can be demonstrated (§8).
 
 ### Session content (consumed by the game in Phase 2)
 ```
@@ -429,7 +448,7 @@ The admin types natural language ("Create 100 math questions from first grade to
    - stem longer than 120 chars (unreadable in 10 seconds — this is a hard product constraint, not a style note)
    - any option longer than 60 chars
    - missing locale
-   - the stem gives the answer away (`answer_in_stem:<locale>`): the correct option appears in the stem as a whole phrase, or any distinctive word of it (≥4 letters, not a question/function word like "which", "city", "cuál") appears as a word, compared case- and accent-insensitively. Checked per locale against that locale's own correct option.
+   - the stem gives the answer away (`answer_in_stem:<locale>`): a distinctive word of the correct option (≥4 letters, not a question/function word like "which", "city", "cuál") appears in the stem as a word, compared case- and accent-insensitively. An option with no distinctive word — a number, a year, a fraction, a symbol — is exempt, because math and comparison questions ("Which is larger: 3/4 or 2/3?" → "3/4") must name their options in the stem. Checked per locale against that locale's own correct option.
    - `content_hash` collides with existing house content
 5. Insert survivors as `status='pending'`, tagged with `generation_job_id`.
 6. Update counts, set the final status, record `cost_cents`, and write `stats`:
@@ -445,6 +464,7 @@ Rejected items are counted, not stored. Rejection reason codes are stable string
 - Demand exactly one defensible correct answer; ambiguity is the main failure mode in trivia generation.
 - Distractors must be plausible and the same category of thing as the answer (all years, all names, all numbers).
 - Forbid "all of the above" / "none of the above".
+- Never list the answer choices inside the stem; the options are shown separately.
 - Forbid questions whose answer changes over time ("current president") unless `tags` includes `time_sensitive`.
 - For Spanish, write the question, don't translate it: natural Spanish word order, ¿ where the question itself begins, no English-style gerunds, standard Spanish spellings of names (Gengis Kan, Keops). Neutral Latin American Spanish that reads naturally to both Mexican and Central American speakers.
 - Difficulty is judged by how many adults would answer correctly, not by how important the topic is: 1 = most adults (who painted the Mona Lisa), 2 = high-school level (year the Berlin Wall fell), 3 = interested amateur (Byzantine Empire's end, 1453), 4 = enthusiast (year of the Treaty of Westphalia), 5 = specialist.

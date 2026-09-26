@@ -1,4 +1,5 @@
-"""telemetry: question_serves, question_stats, question_reports (spec §3)."""
+"""telemetry: question_serves, question_stats, question_reports (spec §3),
+plus the rollup's high-water mark (migration 0003)."""
 import uuid
 
 from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, Text, Uuid, false, text
@@ -50,15 +51,33 @@ class QuestionStats(Base):
     question_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("questions.id", ondelete="CASCADE"), primary_key=True
     )
+    # serves = correct + incorrect + timeouts. An 'absent' serve (player gone)
+    # is counted apart so it never dilutes a ratio or reaches the serves floor.
     serves: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     correct: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     incorrect: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     timeouts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    absents: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     reports: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     avg_response_ms: Mapped[int | None] = mapped_column(Integer)
     last_served_at: Mapped[Timestamp]
+    # Running sum / count behind avg_response_ms, so the rollup can advance
+    # the average without re-reading old serves (migration 0003).
+    timed_serves: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    response_ms_total: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
 
     question: Mapped[Question] = relationship()
+
+
+class RollupWatermark(Base):
+    """High-water mark of an incremental rollup: the last source-row id
+    already folded in. One row per rollup (see app.services.stats)."""
+
+    __tablename__ = "rollup_watermarks"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    last_id: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    updated_at: Mapped[TimestampNow]
 
 
 class QuestionReport(Base):

@@ -129,8 +129,12 @@ def _options_with_answer(i: int, answer: str) -> list[str]:
 _DROP = object()
 
 
-def _answer(raw: dict[str, Any]) -> str:
-    return raw["en"]["options"][raw["correct_index"]]
+def _JUPITER(raw: dict[str, Any]) -> list[str]:
+    """Options with "Jupiter" at the item's correct_index (stub answers are
+    numbers, which the answer-in-stem rule deliberately ignores)."""
+    options = ["Mars", "Venus", "Saturn"]
+    options.insert(raw["correct_index"], "Jupiter")
+    return options
 
 # (path, value) edits applied to a valid item, one per rejection rule in
 # app.services.validation. Paths use "__" to descend into a locale; a callable
@@ -153,7 +157,7 @@ _BAD_VARIANTS: list[dict[str, Any]] = [
     {"difficulty": 0},                                                  # difficulty_invalid
     {"grade_band": "g13"},                                              # grade_band_invalid
     {"tags": "not-a-list"},                                             # tags_invalid
-    {"en__stem": lambda raw: f"Is it {_answer(raw)}?"},                 # answer_in_stem:en
+    {"en__stem": "Which planet is Jupiter?", "en__options": _JUPITER},  # answer_in_stem:en
 ]
 
 
@@ -179,7 +183,7 @@ def _bad_items(params: GenerationParams) -> list[Any]:
 def _mixed_items(params: GenerationParams) -> list[Any]:
     """The stub's opening batch: one good item, a duplicate of it, and one
     bad item per rejection rule."""
-    first = _good(1, params)  # not 0: "what is 0 + 0?" would contain its answer
+    first = _good(0, params)
     return [first, copy.deepcopy(first), *_bad_items(params)]  # second is duplicate_in_batch
 
 

@@ -68,8 +68,8 @@ def test_schema_uses_the_rules():
         ("In what year did the Byzantine Empire fall?", "1453"),
         ("Which city is the capital of Australia?", "Canberra"),
         ("¿Quién fundó el Imperio mongol?", "Gengis Kan"),
-        ("Which planet is the Red Planet?", "Mars"),  # short but a whole-word match
-        ("Which of these is a star?", "Sun"),  # 3 letters, still the whole answer
+        ("Which planet is the Red Planet?", "Mars"),
+        ("Which of these is a star?", "Sun"),
         ("What is 2 + 2?", "4"),
     ],
 )
@@ -80,14 +80,30 @@ def test_answer_not_in_stem_accepts(stem, answer):
 @pytest.mark.parametrize(
     "stem, answer",
     [
+        ("Which is larger: 3/4 or 2/3?", "3/4"),
+        ("Which is greater: 0.5 or 1/3?", "0.5"),
+        ("Which of 9 and 11 is prime?", "11"),
+        ("Which star is the Sun?", "Sun"),  # under 4 letters: not distinctive
+        ("Which battle ended in 1453?", "1453"),
+        ("What is 0 + 0?", "0"),
+    ],
+)
+def test_answer_not_in_stem_ignores_numeric_and_symbolic_answers(stem, answer):
+    """Math and comparison stems have to name their options; an answer
+    with no distinctive word is never a giveaway, even as a whole phrase."""
+    validate_answer_not_in_stem(stem, answer)
+
+
+@pytest.mark.parametrize(
+    "stem, answer",
+    [
         ("Who painted the Mona Lisa, Leonardo's masterpiece?", "Leonardo da Vinci"),
         ("Which empire, the Byzantine one, fell in 1453?", "Byzantine Empire"),  # one word
         ("Which city, Canberra, is Australia's capital?", "Canberra"),
-        ("Which battle ended in 1453?", "1453"),  # whole answer as a word
+        ("Which wonder was in Alexandria?", "Lighthouse of Alexandria"),
         ("¿Qué conquistador, Gengis Kan, unificó Mongolia?", "Gengis Kan"),
         ("¿Quién fue GENGIS KAN?", "Gengis Kan"),  # case-insensitive
         ("¿Qué país tiene Mexico como capital?", "México"),  # accent-insensitive
-        ("Which star is the Sun?", "Sun"),  # whole answer, even under 4 letters
     ],
 )
 def test_answer_not_in_stem_rejects(stem, answer):
