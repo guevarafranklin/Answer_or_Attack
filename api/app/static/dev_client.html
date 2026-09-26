@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Answer or Attack — dev client</title>
+<link rel="icon" href="data:,">
+<style>
+  /* Readable, big tap targets, nothing more (spec §7: thrown away after Phase 3). */
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 18px/1.4 system-ui, sans-serif; background: #fafafa; color: #111; padding-bottom: 4.5rem; }
+  main { max-width: 640px; margin: 0 auto; padding: 12px; }
+  h1 { font-size: 1.3rem; margin: .5rem 0; }
+  h2 { font-size: 1.1rem; margin: 1rem 0 .5rem; }
+  section[hidden] { display: none; }
+  label { display: block; margin: .6rem 0 .2rem; font-size: .9rem; color: #444; }
+  input, select, textarea, button { font: inherit; }
+  input[type=text], select, textarea { width: 100%; padding: .6rem; border: 1px solid #bbb; border-radius: 6px; background: #fff; }
+  textarea { font-family: ui-monospace, monospace; font-size: .9rem; min-height: 5rem; }
+  button { display: block; width: 100%; padding: .8rem; margin: .4rem 0; border: 1px solid #888; border-radius: 8px; background: #fff; cursor: pointer; text-align: left; }
+  button.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; text-align: center; font-weight: 600; }
+  button.small { width: auto; display: inline-block; padding: .4rem .8rem; font-size: .9rem; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.chosen { border: 3px solid #1d4ed8; }
+  button.correct { background: #dcfce7; border-color: #16a34a; }
+  button.wrong { background: #fee2e2; border-color: #dc2626; }
+  .code { font-size: clamp(3rem, 18vw, 7rem); font-weight: 800; letter-spacing: .15em; text-align: center; font-family: ui-monospace, monospace; margin: .5rem 0; word-break: break-all; }
+  .box { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: .8rem; margin: .6rem 0; }
+  .muted { color: #666; font-size: .9rem; }
+  .err { color: #b91c1c; }
+  .ok { color: #15803d; }
+  .big { font-size: 1.4rem; font-weight: 600; }
+  .countdown { font-size: 2.2rem; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+  .topbar { display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+  ul.roster { list-style: none; padding: 0; margin: 0; }
+  ul.roster li { display: flex; justify-content: space-between; padding: .25rem 0; border-bottom: 1px solid #eee; }
+  ul.roster li.absent { color: #999; }
+  ul.roster li.dropped { text-decoration: line-through; color: #bbb; }
+  .delta { font-variant-numeric: tabular-nums; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: right; padding: .3rem .25rem; border-bottom: 1px solid #eee; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  tr.winner td { font-weight: 700; background: #fef9c3; }
+  .cats label { display: flex; gap: .5rem; align-items: center; margin: .3rem 0; font-size: 1rem; color: #111; }
+  .cats input { width: 1.4rem; height: 1.4rem; }
+  .log { font-family: ui-monospace, monospace; font-size: .75rem; color: #555; max-height: 12rem; overflow: auto; white-space: pre-wrap; }
+  .tablewrap { overflow-x: auto; }
+  #debug { position: fixed; left: 0; right: 0; bottom: 0; background: #111; color: #ddd; font: 13px/1.3 ui-monospace, monospace; padding: .5rem .8rem; display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
+  #debug select { width: auto; padding: .2rem; font-size: 13px; background: #222; color: #ddd; border-color: #555; }
+  #debug .state-open { color: #4ade80; } #debug .state-closed, #debug .state-error { color: #f87171; } #debug .state-connecting { color: #fbbf24; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Answer or Attack <span class="muted">dev client</span></h1>
+
+  <section id="home">
+    <label for="name">Your name</label>
+    <input type="text" id="name" maxlength="40" autocomplete="off" autocapitalize="words">
+    <label for="joincode">Join code</label>
+    <input type="text" id="joincode" maxlength="6" autocomplete="off" autocapitalize="characters" style="font-family:ui-monospace,monospace;font-size:1.6rem;letter-spacing:.2em;text-transform:uppercase">
+    <button class="primary" id="btn-join">Join game</button>
+    <p class="muted" style="text-align:center">— or —</p>
+    <button id="btn-to-create">Host a new game</button>
+    <p id="home-msg" class="err"></p>
+  </section>
+
+  <section id="create" hidden>
+    <h2>Host a game</h2>
+    <label for="locale">Locale</label>
+    <select id="locale"><option value="en">en</option><option value="es">es</option></select>
+    <label>Categories</label>
+    <div class="cats box" id="cats"><span class="muted">loading…</span></div>
+    <label for="overrides">Config overrides (JSON, optional)</label>
+    <textarea id="overrides" placeholder='{"question_count": 6, "min_players": 2}'>{}</textarea>
+    <button class="primary" id="btn-create">Create game</button>
+    <button id="btn-back">Back</button>
+    <p id="create-msg" class="err"></p>
+  </section>
+
+  <section id="game" hidden>
+    <div class="topbar">
+      <div>Join code <span id="g-code" class="code" style="display:inline;font-size:1.6rem;letter-spacing:.2em"></span></div>
+      <div id="g-round" class="muted"></div>
+    </div>
+    <div id="lobby-code" class="code" hidden></div>
+    <div class="topbar"><div id="g-phase" class="big"></div><div id="countdown" class="countdown"></div></div>
+    <div id="g-notice"></div>
+    <div id="panel"></div>
+    <div class="box">
+      <div class="topbar"><strong>Players</strong><span id="g-you" class="muted"></span></div>
+      <ul class="roster" id="roster"></ul>
+    </div>
+    <details><summary class="muted">Event log</summary><div class="log" id="log"></div></details>
+    <button id="btn-leave" class="small">Leave (forget this seat)</button>
+  </section>
+</main>
+
+<div id="debug">
+  <span>conn <span id="d-conn" class="state-closed">closed</span></span>
+  <span>rtt <span id="d-rtt">–</span></span>
+  <span>offset <span id="d-off">–</span></span>
+  <label style="display:inline;margin:0;color:#ddd">lag <select id="lagsim">
+    <option value="0">0 ms</option>
+    <option value="150">150±50 ms</option>
+    <option value="400">400±150 ms</option>
+    <option value="800">800±300 ms</option>
+  </select></label>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtDelta = d => d == null ? '' : (d > 0 ? '+' : '') + d;
+
+// ---------- persistent bits (sessionStorage: per tab, survives refresh) ----------
+const store = {
+  get user() { return JSON.parse(sessionStorage.getItem('user') || 'null'); },
+  set user(v) { sessionStorage.setItem('user', JSON.stringify(v)); },
+  get seat() { return JSON.parse(sessionStorage.getItem('seat') || 'null'); },
+  set seat(v) { v ? sessionStorage.setItem('seat', JSON.stringify(v)) : sessionStorage.removeItem('seat'); },
+};
+
+// ---------- HTTP (player stub: X-User-Id, spec §4) ----------
+async function api(method, path, body, userId) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (userId) headers['X-User-Id'] = userId;
+  const r = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = text; }
+  if (!r.ok) throw new Error(`${r.status} ${typeof data === 'object' && data.detail ? JSON.stringify(data.detail) : data}`);
+  return data;
+}
+
+async function ensureUser(name) {
+  const u = store.user;
+  if (u && u.display_name === name) return u;
+  const created = await api('POST', '/dev/guest', { display_name: name });
+  store.user = created;
+  return created;
+}
+
+// ---------- latency simulator (§7): delay + jitter on both directions ----------
+// Delivery times are kept monotone per direction so messages never overtake
+// each other, the way they would not on one TCP socket.
+const PROFILES = { 0: [0, 0], 150: [150, 50], 400: [400, 150], 800: [800, 300] };
+let lag = PROFILES[0], lastOut = 0, lastIn = 0;
+$('lagsim').onchange = e => { lag = PROFILES[e.target.value]; };
+try { $('lagsim').value = sessionStorage.getItem('lag') || '0'; lag = PROFILES[$('lagsim').value]; } catch {}
+$('lagsim').addEventListener('change', e => sessionStorage.setItem('lag', e.target.value));
+const jittered = () => lag[0] ? Math.max(0, lag[0] + (Math.random() * 2 - 1) * lag[1]) : 0;
+function laggy(dir, fn) {
+  const d = jittered();
+  if (!d) { fn(); return; }
+  const now = performance.now();
+  const at = Math.max(now + d, dir === 'out' ? lastOut : lastIn);
+  if (dir === 'out') lastOut = at; else lastIn = at;
+  setTimeout(fn, at - now);
+}
+
+// ---------- state ----------
+const G = {
+  ws: null, gen: 0, wantOpen: false, retryMs: 1000, conn: 'closed',
+  // clock sync (§5): offset in use, the rtt of the sample it came from, when it was adopted
+  offset: 0, offsetRtt: Infinity, offsetAt: 0, lastRtt: null, syncTimer: null,
+  cats: {}, locale: (navigator.language || 'en').startsWith('es') ? 'es' : 'en',
+  // game view
+  phase: 'lobby', round: 0, deadline: null, players: [], host_id: null, picker_id: null, board: [],
+  question: null, block_question: null, attacks: [], you: null, config: {}, end: null,
+  reveal: null, myAnswer: null, ack: null, blockResults: [], notice: '', picked: false,
+};
+const me = () => store.seat && store.seat.player_id;
+const playerName = id => { const p = G.players.find(p => p.player_id === id); return p ? p.display_name : id.slice(0, 8); };
+const catName = id => { const c = G.cats[id]; return c ? (c.names[G.locale] || c.names.en || c.slug) : id.slice(0, 8); };
+
+async function loadCats() {
+  try { for (const c of await api('GET', '/dev/categories')) G.cats[c.id] = c; } catch (e) { log('categories: ' + e.message); }
+}
+
+// ---------- screens ----------
+function show(id) { for (const s of ['home', 'create', 'game']) $(s).hidden = s !== id; window.scrollTo(0, 0); }
+
+$('btn-to-create').onclick = async () => {
+  $('create-msg').textContent = '';
+  show('create');
+  await loadCats();
+  renderCats();
+};
+$('locale').onchange = () => { G.locale = $('locale').value; renderCats(); };
+$('locale').value = G.locale;
+$('btn-back').onclick = () => show('home');
+
+function renderCats() {
+  const cats = Object.values(G.cats);
+  if (!cats.length) { $('cats').innerHTML = '<span class="err">no active categories — seed some first</span>'; return; }
+  const checked = new Set([...document.querySelectorAll('#cats input:checked')].map(i => i.value));
+  $('cats').innerHTML = cats.map(c =>
+    `<label><input type="checkbox" value="${c.id}" ${checked.has(c.id) ? 'checked' : ''}> ${esc(c.icon || '')} ${esc(catName(c.id))}</label>`).join('');
+}
+
+$('btn-create').onclick = async () => {
+  const msg = $('create-msg'); msg.textContent = '';
+  const name = $('name').value.trim();
+  if (!name) { msg.textContent = 'Type your name on the first screen.'; show('home'); return; }
+  let overrides;
+  try { overrides = JSON.parse($('overrides').value || '{}'); } catch (e) { msg.textContent = 'Overrides are not valid JSON: ' + e.message; return; }
+  const category_ids = [...document.querySelectorAll('#cats input:checked')].map(i => i.value);
+  if (!category_ids.length) { msg.textContent = 'Pick at least one category.'; return; }
+  try {
+    const user = await ensureUser(name);
+    const locale = $('locale').value;
+    const created = await api('POST', '/sessions', { category_ids, locale, config_overrides: overrides }, user.user_id);
+    const seat = await api('POST', `/sessions/${created.join_code}/join`, { display_name: name }, user.user_id);
+    store.seat = { join_code: created.join_code, player_id: seat.player_id, player_token: seat.player_token, locale };
+    G.locale = locale;
+    enterGame();
+  } catch (e) { msg.textContent = e.message; }
+};
+
+$('btn-join').onclick = async () => {
+  const msg = $('home-msg'); msg.textContent = '';
+  const name = $('name').value.trim();
+  const code = $('joincode').value.trim().toUpperCase();
+  if (!name || !code) { msg.textContent = 'Name and join code, please.'; return; }
+  try {
+    const user = await ensureUser(name);
+    const seat = await api('POST', `/sessions/${code}/join`, { display_name: name }, user.user_id);
+    store.seat = { join_code: code, player_id: seat.player_id, player_token: seat.player_token, locale: G.locale };
+    enterGame();
+  } catch (e) { msg.textContent = e.message; }
+};
+
+$('btn-leave').onclick = () => { leave(''); };
+
+function leave(reason) {
+  G.wantOpen = false;
+  if (G.ws) { try { G.ws.close(); } catch {} G.ws = null; }
+  store.seat = null;
+  $('home-msg').textContent = reason;
+  show('home');
+}
+
+async function enterGame() {
+  const seat = store.seat;
+  G.locale = seat.locale || G.locale;
+  if (!Object.keys(G.cats).length) await loadCats();
+  $('g-code').textContent = seat.join_code;
+  $('lobby-code').textContent = seat.join_code;
+  $('log').textContent = '';
+  show('game');
+  G.wantOpen = true; G.retryMs = 1000;
+  connect();
+}
+
+// ---------- socket ----------
+function setConn(state) { G.conn = state; const el = $('d-conn'); el.textContent = state; el.className = 'state-' + state; }
+
+function connect() {
+  const seat = store.seat;
+  if (!G.wantOpen || !seat) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/sessions/${seat.join_code}?token=${encodeURIComponent(seat.player_token)}`);
+  G.ws = ws; setConn('connecting');
+  const gen = ++G.gen;  // frames from an older socket are dropped once a newer one exists
+  let opened = false;
+  ws.onopen = () => {
+    opened = true; setConn('open'); G.retryMs = 1000;
+    log('connected');
+    syncBurst();
+    clearInterval(G.syncTimer); G.syncTimer = setInterval(syncBurst, 30000);
+  };
+  // The close goes through the same simulated lag as the data, after it:
+  // the server closes right after `end`, and that message must still land.
+  ws.onmessage = ev => laggy('in', () => { if (gen === G.gen) onMessage(JSON.parse(ev.data)); });
+  ws.onerror = () => setConn('error');
+  ws.onclose = ev => laggy('in', () => {
+    if (gen !== G.gen) return;
+    G.ws = null; clearInterval(G.syncTimer);
+    setConn('closed');
+    log(`closed ${ev.code} ${ev.reason || ''}`);
+    switch (ev.code) {
+      case 4000: G.wantOpen = false; notice('This seat was opened in another tab. Close this one.'); return;
+      case 4001: leave('That seat is gone (bad token). Join again.'); return;
+      case 4003: leave('Refused: ' + (ev.reason || 'not seated in this game')); return;
+      case 4004: G.wantOpen = false; if (G.phase !== 'end') notice('The session is over.'); render(); return;
+    }
+    if (!G.wantOpen) return;
+    setConn('connecting');
+    const retry = () => { setTimeout(connect, G.retryMs); G.retryMs = Math.min(G.retryMs * 2, 10000); };
+    if (opened) retry();  // network blip: come back with the same token (§2.8 rejoin)
+    else probeSeat().then(ok => { if (ok && G.wantOpen) retry(); });
+  });
+}
+
+async function probeSeat() {
+  // The handshake was refused. The server closes with 4001/4004 before
+  // accepting, which a browser only ever sees as 1006 — so ask the join
+  // endpoint what it thinks of this seat: 200 means try the socket again
+  // (and in the lobby it hands back a fresh token), 404/409 means leave.
+  const seat = store.seat, user = store.user;
+  if (!seat || !user) { leave('No seat to rejoin.'); return false; }
+  try {
+    const r = await api('POST', `/sessions/${seat.join_code}/join`, { display_name: user.display_name, player_token: seat.player_token }, user.user_id);
+    if (r.player_token !== seat.player_token) store.seat = { ...seat, player_token: r.player_token };
+    return true;
+  } catch (e) {
+    if (e instanceof TypeError) return true;  // server unreachable: keep trying
+    leave('Cannot rejoin: ' + e.message);
+    return false;
+  }
+}
+
+function send(obj) {
+  const ws = G.ws;
+  if (!ws) return;
+  laggy('out', () => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); });
+}
+
+// ---------- clock sync (§5): the client's own offset, for the countdown only ----------
+function syncBurst() {
+  for (let i = 0; i < 5; i++) setTimeout(() => send({ type: 'sync', client_ms: Date.now() }), i * 100);
+}
+function onSyncReply(m) {
+  const recv = Date.now();
+  const rtt = recv - m.client_ms;
+  const offset = m.server_ms - (m.client_ms + recv) / 2;
+  G.lastRtt = rtt;
+  // Adopt the lowest-rtt sample; a stale offset (>60 s) is replaced regardless,
+  // and within one burst the later, shorter samples then win over it.
+  if (rtt <= G.offsetRtt || recv - G.offsetAt > 60000) { G.offset = offset; G.offsetRtt = rtt; G.offsetAt = recv; }
+  $('d-rtt').textContent = `${rtt}ms (best ${G.offsetRtt}ms)`;
+  $('d-off').textContent = `${G.offset >= 0 ? '+' : ''}${Math.round(G.offset)}ms`;
+}
+const serverNow = () => Date.now() + G.offset;
+setInterval(() => {
+  const el = $('countdown');
+  if (G.deadline == null || G.phase === 'end' || G.phase === 'lobby') { el.textContent = ''; return; }
+  el.textContent = (Math.max(0, G.deadline - serverNow()) / 1000).toFixed(1) + 's';
+}, 100);
+
+// ---------- inbound ----------
+function log(line) {
+  const el = $('log');
+  el.textContent = (new Date().toLocaleTimeString() + ' ' + line + '\n' + el.textContent).split('\n').slice(0, 60).join('\n');
+}
+function notice(text, cls) { G.notice = `<p class="${cls || 'err'}">${esc(text)}</p>`; render(); }
+
+function onMessage(m) {
+  if (m.type !== 'ping' && m.type !== 'sync_reply') log(JSON.stringify(m).slice(0, 300));
+  switch (m.type) {
+    case 'ping': send({ type: 'pong', server_ms: m.server_ms }); return;  // echo at once, nothing added (§5)
+    case 'sync_reply': onSyncReply(m); return;
+    case 'state':
+      Object.assign(G, {
+        phase: m.phase, round: m.round, deadline: m.deadline_ms, players: m.players, host_id: m.host_id,
+        picker_id: m.picker_id, board: m.board, question: m.question, block_question: m.block_question,
+        attacks: m.attacks, you: m.you, config: m.config, end: m.end, reveal: null, myAnswer: null, ack: null,
+        blockResults: [], notice: '',
+      });
+      break;
+    case 'lobby': G.players = m.players; G.host_id = m.host_id; G.config = m.config; break;
+    case 'presence': {
+      const p = G.players.find(p => p.player_id === m.player_id);
+      if (p) { p.present = m.status === 'returned'; if (m.status === 'dropped') p.dropped = true; }
+      break;
+    }
+    case 'phase':
+      G.phase = m.phase; G.round = m.round; G.deadline = m.deadline_ms; G.notice = '';
+      if (m.phase === 'pick') { G.board = []; G.question = null; G.reveal = null; G.attacks = []; G.block_question = null; G.myAnswer = null; G.ack = null; G.picked = false; }
+      if (m.phase === 'question') { G.blockResults = []; G.myAnswer = null; G.ack = null; if (G.you) G.you.answered = false; }
+      if (m.phase === 'attack') { G.attacks = []; if (G.you) G.you.acted = false; }
+      if (m.phase === 'block') { G.block_question = null; G.myAnswer = null; G.ack = null; if (G.you) G.you.answered = false; }
+      break;
+    case 'board': G.picker_id = m.picker_id; G.board = m.category_ids; break;
+    case 'question': G.question = m; G.deadline = m.deadline_ms; break;
+    case 'answer_ack': G.ack = m; break;
+    case 'reveal':
+      G.reveal = m;
+      if (G.you) { G.you.tokens = m.tokens; G.you.streak = m.streak; }
+      for (const p of G.players) if (m.deltas[p.player_id] != null) p.delta = m.deltas[p.player_id];
+      break;
+    case 'attacks': G.attacks = m.attacks; break;
+    case 'pass_ack': if (G.you) G.you.acted = true; break;
+    case 'block_question': G.block_question = m; G.deadline = m.deadline_ms; break;
+    case 'block_result':
+      G.blockResults.push(m);
+      if (m.delta != null) { const p = G.players.find(p => p.player_id === m.target_id); if (p) p.delta = m.delta; }
+      break;
+    case 'end': G.end = m; G.phase = 'end'; G.deadline = null; G.notice = ''; break;
+    case 'error': G.notice = `<p class="err">${esc(m.code)}: ${esc(m.message)}</p>`; break;
+    case 'report_ack': break;
+  }
+  render();
+}
+
+// ---------- actions ----------
+window.act = {
+  start: () => send({ type: 'start' }),
+  pick: id => { G.picked = true; send({ type: 'pick', category_id: id }); render(); },
+  answer: (qid, option) => { G.myAnswer = { question_id: qid, option }; G.ack = null; send({ type: 'answer', question_id: qid, option }); render(); },
+  attack: id => { if (G.you) G.you.acted = true; send({ type: 'attack', target_player_id: id }); render(); },
+  pass: () => { if (G.you) G.you.acted = true; send({ type: 'pass' }); render(); },
+};
+
+// ---------- render ----------
+const PHASE_LABEL = { lobby: 'Lobby', pick: 'Pick a category', question: 'Question', reveal: 'Reveal', attack: 'Attack window', block: 'Block', end: 'Game over' };
+
+function render() {
+  const my = me();
+  $('g-round').textContent = G.round ? `round ${G.round} / ${G.config.question_count ?? '?'}` : '';
+  $('g-phase').textContent = PHASE_LABEL[G.phase] || G.phase;
+  $('lobby-code').hidden = G.phase !== 'lobby';
+  $('g-notice').innerHTML = G.notice;
+  if (G.phase === 'end' || G.phase === 'lobby') $('countdown').textContent = '';
+  $('g-you').textContent = G.you ? `you: ${G.you.tokens} token${G.you.tokens === 1 ? '' : 's'}, streak ${G.you.streak}` : '';
+  $('roster').innerHTML = G.players.map(p => {
+    const tags = [p.player_id === my ? 'you' : '', p.is_host ? 'host' : '', p.player_id === G.picker_id && G.phase === 'pick' ? 'picking' : '',
+      p.dropped ? 'dropped' : (!p.present ? 'absent' : '')].filter(Boolean).map(t => `<span class="muted">${t}</span>`).join(' ');
+    return `<li class="${p.dropped ? 'dropped' : (!p.present ? 'absent' : '')}"><span>${esc(p.display_name)} ${tags}</span><span class="delta">${fmtDelta(p.delta)}</span></li>`;
+  }).join('');
+  $('panel').innerHTML = panelFor(G.phase, my);
+}
+
+function optionButtons(q, { chosen, correct, disabled }) {
+  return q.options.map((o, i) => {
+    const cls = [i === correct ? 'correct' : '', chosen === i && correct != null && i !== correct ? 'wrong' : '', chosen === i ? 'chosen' : ''].filter(Boolean).join(' ');
+    return `<button class="${cls}" ${disabled ? 'disabled' : ''} onclick="act.answer('${q.question_id}',${i})">${'ABCD'[i]}. ${esc(o)}</button>`;
+  }).join('');
+}
+
+function attacksList() {
+  if (!G.attacks.length) return '<p class="muted">No attacks declared yet.</p>';
+  return '<ul>' + G.attacks.map(a => `<li>${esc(playerName(a.attacker_id))} → ${esc(playerName(a.target_id))}</li>`).join('') + '</ul>';
+}
+
+function blockResultsList(my) {
+  return G.blockResults.map(r => {
+    const who = esc(playerName(r.target_id));
+    let line = r.blocked ? `<span class="ok">${who} blocked ${r.attacker_ids.length} attack(s)</span>` : `<span class="err">${who} failed to block ${r.attacker_ids.length} attack(s)</span>`;
+    if (r.target_id === my) line += ` — you take ${r.damage} (delta now ${fmtDelta(r.delta)})`;
+    else if (r.gained != null) line += ` — you gain ${r.gained}`;
+    return `<p>${line}</p>`;
+  }).join('');
+}
+
+function panelFor(phase, my) {
+  const you = G.you || { tokens: 0, streak: 0, answered: false, acted: false };
+  switch (phase) {
+    case 'lobby': {
+      const present = G.players.filter(p => p.present).length;
+      const cfg = Object.entries(G.config).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' · ');
+      const isHost = my === G.host_id;
+      return `<div class="box">
+        <p>${present} present · needs ${G.config.min_players ?? '?'} to start · max ${G.config.max_players ?? '?'}</p>
+        ${isHost ? `<button class="primary" onclick="act.start()" ${present < (G.config.min_players || 0) ? 'disabled' : ''}>Start game</button>`
+                 : `<p class="muted">Waiting for ${esc(G.host_id ? playerName(G.host_id) : 'the host')} to start…</p>`}
+        <p class="muted">${esc(cfg)}</p></div>`;
+    }
+    case 'pick': {
+      const board = G.board.map(id => `<button ${my === G.picker_id && !G.picked ? '' : 'disabled'} onclick="act.pick('${id}')">${esc(catName(id))}</button>`).join('');
+      return `<div class="box">${my === G.picker_id ? '<p class="big">Your pick!</p>' : `<p>${esc(playerName(G.picker_id || ''))} is picking…</p>`}${board}</div>${blockResultsList(my)}`;
+    }
+    case 'question': {
+      if (!G.question) return '<p class="muted">Waiting for the question…</p>';
+      const q = G.question, chosen = G.myAnswer && G.myAnswer.question_id === q.question_id ? G.myAnswer.option : null;
+      const done = chosen != null || you.answered;
+      let ack = '';
+      if (G.ack && G.ack.question_id === q.question_id) ack = G.ack.accepted ? '<p class="ok">Answer accepted.</p>' : `<p class="err">Rejected: ${esc(G.ack.reason || '')}</p>`;
+      else if (chosen != null) ack = '<p class="muted">Sending…</p>';
+      else if (you.answered) ack = '<p class="muted">Already answered before reconnecting.</p>';
+      return `<div class="box"><p class="muted">${esc(catName(q.category_id))}</p><p class="big">${esc(q.stem)}</p>${optionButtons(q, { chosen, disabled: done })}${ack}</div>`;
+    }
+    case 'reveal': {
+      const r = G.reveal;
+      if (!r || !G.question) return '<p class="muted">Revealing…</p>';
+      const chosen = G.myAnswer && G.myAnswer.question_id === r.question_id ? G.myAnswer.option : null;
+      const outcome = { correct: `<span class="ok">Correct! ${fmtDelta(r.points)}</span>`, incorrect: `<span class="err">Wrong ${fmtDelta(r.points)}</span>`,
+        timeout: `<span class="err">Too slow ${fmtDelta(r.points)}</span>`, absent: '<span class="muted">Absent, no change</span>' }[r.outcome] || '<span class="muted">Not served</span>';
+      return `<div class="box"><p class="big">${esc(G.question.stem)}</p>${optionButtons(G.question, { chosen, correct: r.correct_option, disabled: true })}
+        <p class="big">${outcome}</p><p>Your delta: <b>${fmtDelta(r.delta)}</b> · streak ${r.streak} · tokens ${r.tokens}${r.token_earned ? ' · <b class="ok">token earned!</b>' : ''}</p></div>`;
+    }
+    case 'attack': {
+      let mine;
+      if (you.acted) mine = '<p class="muted">You have acted this window.</p>';
+      else if (you.tokens > 0) {
+        const targets = G.players.filter(p => p.player_id !== my && !p.dropped)
+          .map(p => `<button onclick="act.attack('${p.player_id}')">⚔ Attack ${esc(p.display_name)} <span class="muted">(${fmtDelta(p.delta)})</span></button>`).join('');
+        mine = `<p class="big">You hold ${you.tokens} token${you.tokens === 1 ? '' : 's'}.</p>${targets}<button onclick="act.pass()">Pass</button>`;
+      } else mine = '<p class="muted">No token — watching.</p>';
+      return `<div class="box">${mine}</div><div class="box"><strong>Attacks this window</strong>${attacksList()}</div>`;
+    }
+    case 'block': {
+      let mine = '';
+      if (G.block_question) {
+        const q = G.block_question, chosen = G.myAnswer && G.myAnswer.question_id === q.question_id ? G.myAnswer.option : null;
+        const done = chosen != null || you.answered;
+        let ack = '';
+        if (G.ack && G.ack.question_id === q.question_id) ack = G.ack.accepted ? '<p class="ok">Answer accepted.</p>' : `<p class="err">Rejected: ${esc(G.ack.reason || '')}</p>`;
+        mine = `<div class="box"><p class="err big">Block it! Attacked by ${q.attacker_ids.map(id => esc(playerName(id))).join(', ')}</p>
+          <p class="big">${esc(q.stem)}</p>${optionButtons(q, { chosen, disabled: done })}${ack}</div>`;
+      } else {
+        const targets = [...new Set(G.attacks.map(a => a.target_id))].map(playerName).map(esc).join(', ');
+        mine = `<div class="box"><p>${targets ? `${targets} answering block question(s)…` : 'Blocks in progress…'}</p></div>`;
+      }
+      return mine + `<div class="box"><strong>Attacks</strong>${attacksList()}${blockResultsList(my)}</div>`;
+    }
+    case 'end': {
+      const e = G.end;
+      if (!e) return '<p class="muted">Game over.</p>';
+      const winners = e.winner_ids.map(playerName).map(esc).join(' & ');
+      const rows = e.results.map((r, i) => `<tr class="${e.winner_ids.includes(r.player_id) ? 'winner' : ''}">
+        <td>${i + 1}</td><td>${esc(r.display_name)}${r.player_id === my ? ' (you)' : ''}</td><td>${r.starting_xp}</td><td>${r.final_xp}</td>
+        <td>${fmtDelta(r.delta)}</td><td>${fmtDelta(r.nominal_delta)}</td><td>${r.mean_correct_ms == null ? '–' : Math.round(r.mean_correct_ms)}</td></tr>`).join('');
+      return `<div class="box"><p class="big">🏆 ${winners || 'nobody'}</p>
+        <p class="muted">${esc(e.reason)} · tiebreak: ${esc(e.tiebreak || 'none')}</p>
+        <div class="tablewrap"><table><thead><tr><th>#</th><th>player</th><th>start</th><th>final</th><th>real Δ</th><th>nominal Δ</th><th>mean correct ms</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+    }
+  }
+  return '';
+}
+
+// ---------- boot: rejoin automatically on refresh ----------
+(() => {
+  const u = store.user;
+  if (u) $('name').value = u.display_name;
+  if (store.seat) enterGame(); else show('home');
+})();
+</script>
+</body>
+</html>

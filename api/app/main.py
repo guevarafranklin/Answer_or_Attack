@@ -6,7 +6,7 @@ from app import db
 from app.auth import verify_admin_user
 from app.config import settings
 from app.game import persistence, runtime
-from app.routers import categories, generation, health, questions, reports, sessions, ws
+from app.routers import categories, dev, generation, health, questions, reports, sessions, ws
 
 # Live games write their snapshot and event log through these hooks.
 runtime.registry.hooks = persistence.Persistence()
@@ -35,6 +35,7 @@ app.include_router(health.router)
 app.include_router(reports.router)
 app.include_router(sessions.router)
 app.include_router(ws.router)
+app.include_router(dev.router)  # 404 unless ENV=dev (spec §7)
 
 
 @app.get("/health")
