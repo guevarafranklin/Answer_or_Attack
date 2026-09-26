@@ -1,0 +1,1 @@
+- Never amend a migration after it has been committed or applied to the dev DB. Write a new migration instead.
