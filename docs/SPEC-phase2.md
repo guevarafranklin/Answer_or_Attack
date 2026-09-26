@@ -200,7 +200,7 @@ Two measurements, two owners. The **server measures each player's round trip** i
 
 - **`POST /sessions/generate` is replaced by the draw at `start`.** The draw produces, per selected category, a pool of `ceil(question_count / categories) + 2` questions ramped easy→hard, plus a block reserve of `max_players` difficulty 2–3 questions from any selected category. Same guarantees: no duplicates across all pools and reserve, per-session option shuffle stored in `session_questions.option_order`, `short_by` when the pool is thin. Add `session_questions.pool` (category id or `'block'`) with a new migration.
 - **Session status** transitions `lobby → running → finished | abandoned` are owned by the runtime.
-- **Persistence at END:** `session_players.starting_xp/final_xp/delta_xp`, session `ended_at`, and `record_serves` for every question shown (outcomes include `absent`).
+- **Persistence at END:** `session_players.starting_xp/final_xp/delta_xp`, session `ended_at`, and `record_serves` for every question shown (outcomes include `absent`). As built (step 8): `on_end` → `persist_end`, one transaction from the engine's final state — every seat the engine saw (dropped players included; seats that never connected keep NULLs), `ended_at` if not yet set, one serve per engine `ServeRecord` (round and block, `response_ms` RTT-corrected). Idempotent: a session whose seats already carry a `final_xp` is left alone, so a retried, resumed or replayed END writes nothing twice. Abandoned games persist what reached a reveal.
 
 New tables (new migration):
 ```sql

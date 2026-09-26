@@ -25,7 +25,7 @@ from app.game import persistence, runtime, snapshot
 from app.game.engine import Phase
 from app.game.replay import ReplayError, replay
 from app.game.seed import engine_rng
-from app.models import GameSession, SessionEvent
+from app.models import GameSession, QuestionServe, SessionEvent, SessionPlayer
 from app.rules import OPTION_COUNT
 from app.services import sessions as svc
 from tests.asgi_ws import Closed
@@ -582,3 +582,167 @@ async def test_the_end_of_a_game_flushes_the_log_and_drops_the_snapshot(live: Wo
     assert len(await t.events()) == t.rt.seq
     assert t.key not in live.redis.store
     assert t.hooks._writers == {}
+
+
+# ---------- §10 step 8: persistence at END ----------
+
+
+async def _persisted(t: Table) -> tuple[list[SessionPlayer], list[QuestionServe]]:
+    async with live_factory(t)() as s:
+        seats = (await s.scalars(select(SessionPlayer).where(SessionPlayer.session_id == t.session_id))).all()
+        serves = (await s.scalars(select(QuestionServe).where(QuestionServe.session_id == t.session_id))).all()
+    return list(seats), list(serves)
+
+
+def live_factory(t: Table):
+    return t.live.factory
+
+
+def _serve_key(x: Any) -> tuple[str, str, str, int | None]:
+    return (str(x.question_id), str(x.user_id if isinstance(x, QuestionServe) else x.player_id), x.outcome, x.response_ms)
+
+
+def _assert_end_persisted(t: Table, state: eng.GameState, seats: list[SessionPlayer], serves: list[QuestionServe]) -> None:
+    assert state.phase is Phase.END and state.results is not None
+    by_user = {str(seat.user_id): seat for seat in seats}
+    for p in state.players.values():
+        seat = by_user[p.id]
+        assert (seat.starting_xp, seat.final_xp, seat.delta_xp) == (p.starting_xp, p.xp, p.xp - p.starting_xp)
+    for r in state.results:
+        assert (by_user[r.player_id].final_xp, by_user[r.player_id].delta_xp) == (r.final_xp, r.delta)
+    assert sorted(map(_serve_key, serves)) == sorted(map(_serve_key, state.serves))
+    assert all(x.locale == "en" and x.served_at is not None for x in serves)
+    assert all(x.response_ms is None or x.response_ms >= 0 for x in serves)
+
+
+@pytest.mark.asyncio
+async def test_a_finished_game_persists_seats_and_serves_from_the_final_state(live: World):
+    t = await table(live, seed=9)
+    await t.start()
+    await t.play_to_end()
+    state = t.rt.state
+    seats, serves = await _persisted(t)
+    _assert_end_persisted(t, state, seats, serves)
+    row = await t.row()
+    assert row.status == "finished" and row.ended_at is not None
+
+    # One serve per question shown per player: three round questions to
+    # three players, plus one per block question asked.
+    round_qs = {x.question_id for x in state.serves if x.kind == "question"}
+    blocks = [x for x in state.serves if x.kind == "block"]
+    assert len(round_qs) == 3 and len(blocks) > 0
+    assert len(serves) == len(round_qs) * 3 + len(blocks) == len(state.serves)
+    outcomes = {x.outcome for x in serves}
+    assert outcomes <= {"correct", "incorrect", "timeout", "absent"} and {"correct", "incorrect"} <= outcomes
+    # Response times are the engine's judged ones (RTT credit applied),
+    # only for answered serves.
+    for x in serves:
+        assert (x.response_ms is None) == (x.outcome in ("timeout", "absent"))
+
+
+@pytest.mark.asyncio
+async def test_a_retried_or_replayed_end_writes_nothing_twice(live: World):
+    t = await table(live, seed=9)
+    await t.start()
+    await t.play_to_end()
+    rt = t.rt
+    seats, serves = await _persisted(t)
+    ended_at = (await t.row()).ended_at
+
+    # The hook again (a retry), and the function on a replayed final state.
+    await t.hooks.on_end(rt, eng.ended(rt.state))
+    async with live.factory() as s:
+        replayed = await replay(s, t.session_id)
+    assert await persistence.persist_end(live.factory, t.session_id, replayed) is False
+
+    again_seats, again_serves = await _persisted(t)
+    assert [(x.user_id, x.starting_xp, x.final_xp, x.delta_xp) for x in again_seats] == [
+        (x.user_id, x.starting_xp, x.final_xp, x.delta_xp) for x in seats
+    ]
+    assert sorted(x.id for x in again_serves) == sorted(x.id for x in serves)
+    assert (await t.row()).ended_at == ended_at
+    with pytest.raises(persistence.NotEnded):
+        await persistence.persist_end(live.factory, t.session_id, eng.new_game(rt.state.config, {}, []))
+
+
+@pytest.mark.asyncio
+async def test_resuming_an_already_ended_log_does_not_persist_again(live: World):
+    """The crash-after-the-final-step case: the first process may or may
+    not have persisted before dying; resume finishes the game and the
+    result is there exactly once either way."""
+    t = await table(live, seed=5)
+    await t.start()
+    await t.play_until(lambda rt: rt.state.round == 3)
+    await t.hooks.flush(t.rt)
+    older = live.redis.store[t.key]
+    await t.play_to_end()
+    seats, serves = await _persisted(t)
+    assert serves and all(x.final_xp is not None for x in seats)
+    async with live.factory() as s:
+        row = await s.get(GameSession, t.session_id)
+        assert row is not None
+        row.status, row.ended_at = "running", None
+        await s.commit()
+    live.redis.store[t.key] = older
+
+    _install(live, t.clock, persistence.Persistence())
+    (rt,) = await persistence.resume(t.registry)
+    assert rt.finished
+    again_seats, again_serves = await _persisted(t)
+    assert sorted(x.id for x in again_serves) == sorted(x.id for x in serves)
+    assert [(x.user_id, x.final_xp) for x in again_seats] == [(x.user_id, x.final_xp) for x in seats]
+    row = await t.row()
+    assert row.status == "finished" and row.ended_at is not None
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_game_persists_what_was_played_dropped_player_included(live: World):
+    t = await table(live, seed=4, question_count=5, rejoin_seconds=3, abandon_seconds=5)
+    await t.start()
+    host, beth, carl = t.socks
+    # Carl leaves during the first question, is absent for it, and is
+    # dropped once the rejoin window passes.
+    await t.play_until(lambda rt: rt.state.phase is Phase.QUESTION)
+    t.rt.disconnect(carl, t.socks[carl])
+    await settled(t.rt)
+    assert not t.rt.state.players[carl].present
+    await t.play_until(lambda rt: rt.state.players[carl].dropped)
+    assert t.rt.state.phase is not Phase.END
+    # The other two play on into round 3, then both leave: abandoned
+    # after abandon_seconds with nobody back.
+    await t.play_until(lambda rt: rt.state.round == 3 and rt.state.phase is Phase.QUESTION)
+    for pid in (host, beth):
+        t.rt.disconnect(pid, t.socks[pid])
+    await settled(t.rt)
+    await t.play_to_end()
+    state = t.rt.state
+    assert state.end_reason == "abandoned"
+
+    row = await t.row()
+    assert row.status == "abandoned" and row.ended_at is not None
+    seats, serves = await _persisted(t)
+    _assert_end_persisted(t, state, seats, serves)
+    by_user = {str(x.user_id): x for x in seats}
+    carl_seat = by_user[carl]
+    assert carl_seat.starting_xp is not None and carl_seat.final_xp == carl_seat.starting_xp and carl_seat.delta_xp == 0
+    carl_serves = [x for x in serves if str(x.user_id) == carl]
+    assert carl_serves and all(x.outcome == "absent" and x.response_ms is None for x in carl_serves)
+    # Only what was played: the two round questions that reached their
+    # reveal (the third was open when the game died), not five.
+    assert len({x.question_id for x in state.serves if x.kind == "question"}) == 2
+    assert len(serves) == len(state.serves) < 5 * 3
+    assert t.key not in live.redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_seat_that_never_played_keeps_nulls(live: World):
+    t = await table(live, seed=9)
+    dan = await live.user("dan")
+    await live.seat(dan, t.code, "dan")  # seated, never connected
+    await t.start()
+    await t.play_to_end()
+    seats, serves = await _persisted(t)
+    dan_seat = next(x for x in seats if x.user_id == dan)
+    assert (dan_seat.starting_xp, dan_seat.final_xp, dan_seat.delta_xp) == (None, None, None)
+    assert not [x for x in serves if x.user_id == dan]
+    assert sum(x.final_xp is not None for x in seats) == 3

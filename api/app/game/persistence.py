@@ -21,6 +21,16 @@ store never holds up a round:
 Both are flushed when the game ends and at process shutdown, and the
 snapshot of a finished game is deleted.
 
+**At END** (§10 step 8) `on_end` also persists the result, in one
+transaction (`persist_end`): every seat's real `starting_xp`, `final_xp`
+and `delta_xp` — dropped players included — the session's `ended_at`,
+and one `question_serves` row per serve the engine recorded (round and
+block questions; outcomes correct / incorrect / timeout / absent;
+`response_ms` as the engine judged it, RTT credit applied). Abandoned
+games persist what was played. It is idempotent: a session whose seats
+already carry a `final_xp` is left alone, so a retried or replayed END
+writes nothing twice.
+
 `resume` runs at startup: every session the DB says is `running` gets
 its runtime back from its snapshot (`Registry.restore`), or is marked
 `abandoned` when there is none — the socket handshake refuses a running
@@ -42,9 +52,11 @@ from app import cache, db
 from app.game import engine as eng
 from app.game import protocol as proto
 from app.game import snapshot
-from app.game.engine import GameState
+from app.game.engine import GameState, Phase
 from app.game.runtime import Registry, RuntimeHooks, SessionRuntime
-from app.models import GameSession, SessionEvent
+from app.models import GameSession, SessionEvent, SessionPlayer
+from app.schemas.telemetry import QuestionServeCreate
+from app.services import serves as serves_svc
 from app.services import sessions as svc
 
 log = logging.getLogger(__name__)
@@ -53,6 +65,7 @@ SNAPSHOT_TTL = timedelta(hours=3)
 INSERT_CHUNK = 500  # events per INSERT
 RETRIES = 5  # attempts at one chunk before it is dropped (logged as an error)
 RETRY_SECONDS = 1.0
+END_RETRIES = 3  # attempts at persisting the result at END
 
 SessionFactory = Callable[[], AsyncSession]
 
@@ -163,6 +176,19 @@ class Persistence(RuntimeHooks):
         w = self._writers.pop(rt.session_id, None)
         if w is not None:
             await w.drain()
+        for attempt in range(1, END_RETRIES + 1):
+            try:
+                await persist_end(self.session_factory(), rt.session_id, rt.state)
+                break
+            except Exception:
+                log.warning(
+                    "session %s: persisting the result failed (attempt %d/%d)",
+                    rt.join_code, attempt, END_RETRIES, exc_info=True,
+                )
+                if attempt == END_RETRIES:
+                    log.error("session %s: result not persisted; replay the event log to recover", rt.join_code)
+                else:
+                    await asyncio.sleep(RETRY_SECONDS * attempt)
         try:
             await (await cache.get_redis()).delete(state_key(rt.session_id))
         except Exception:
@@ -177,6 +203,59 @@ class Persistence(RuntimeHooks):
         w = self._writers.get(rt.session_id)
         if w is not None:
             await w.drain()
+
+
+# ---------- END ----------
+
+
+class NotEnded(Exception):
+    """persist_end was given a state that is not at END."""
+
+
+async def persist_end(factory: SessionFactory, session_id: uuid.UUID, state: GameState) -> bool:
+    """§6 persistence at END, in one transaction: the seats' real XP
+    figures, `ended_at`, and the serves. Returns False — and writes
+    nothing — when the session's result is already there (any seat
+    with a `final_xp`), so it can be retried or run again from a replay
+    freely. Seats the engine never saw (joined but never connected
+    before Start) keep NULLs; dropped players get their figures like
+    everyone else."""
+    if state.phase is not Phase.END:
+        raise NotEnded(f"session {session_id} is in {state.phase.value}, not END")
+    async with factory() as session:
+        row = await session.get(GameSession, session_id, with_for_update=True)
+        if row is None:
+            raise LookupError(f"no session {session_id}")
+        seats = (
+            await session.scalars(
+                select(SessionPlayer).where(SessionPlayer.session_id == session_id).with_for_update()
+            )
+        ).all()
+        if any(seat.final_xp is not None for seat in seats):
+            return False
+        for seat in seats:
+            p = state.players.get(str(seat.user_id))
+            if p is None:
+                continue
+            seat.starting_xp, seat.final_xp, seat.delta_xp = p.starting_xp, p.xp, p.delta
+        if row.ended_at is None:
+            row.ended_at = datetime.now(timezone.utc)
+        await serves_svc.record_serves(
+            session,
+            [
+                QuestionServeCreate(
+                    question_id=uuid.UUID(serve.question_id),
+                    session_id=session_id,
+                    user_id=uuid.UUID(serve.player_id),
+                    locale=row.locale,
+                    outcome=serve.outcome,
+                    response_ms=serve.response_ms,
+                )
+                for serve in state.serves
+            ],
+        )
+        await session.commit()
+    return True
 
 
 # ---------- resume ----------
