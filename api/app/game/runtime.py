@@ -27,6 +27,12 @@ The runtime owns:
   `protocol.state_message`), the only place client payloads are built;
 * `start`: the question draw (`draw_at_start`), the commit, the Redis
   cache, `status = running`, then the engine's `Start`;
+* the RTT measurement (§5, `app.game.latency`): a pinger task per
+  socket queues `ping` items (a burst on connect, then one every 15 s),
+  the game task stamps and sends them, and a `pong` coming back through
+  the queue is a sample stamped on receipt. The player's rolling median
+  is what `Answer.rtt_ms` carries into the engine, where half of it
+  comes off the recorded response time. It is never a scoring input;
 * what is not a game event: `sync` is answered here, `report` goes
   through the report service.
 
@@ -53,6 +59,7 @@ from pydantic import ValidationError
 
 from app import cache, db
 from app.game import engine as eng
+from app.game import latency
 from app.game import protocol as proto
 from app.game.config import GameConfig
 from app.game.engine import GameState, Phase
@@ -126,7 +133,7 @@ class RuntimeHooks:
 
 # ---------- inbound queue ----------
 
-ItemKind = Literal["connect", "disconnect", "message", "tick", "report_done"]
+ItemKind = Literal["connect", "disconnect", "message", "tick", "ping", "report_done"]
 
 
 @dataclass(slots=True)
@@ -169,10 +176,12 @@ class SessionRuntime:
         self.queue: asyncio.Queue[_Item] = asyncio.Queue()
         self.sockets: dict[str, Socket] = {}
         self.shown: dict[str, set[str]] = {}  # question ids each player has seen
+        self.latency: dict[str, latency.RttTracker] = {}  # per connected player
         self.finished: bool = False
         self._task: asyncio.Task[None] | None = None
         self._timer: asyncio.Task[None] | None = None
         self._armed_for: int | None = None
+        self._pingers: dict[str, asyncio.Task[None]] = {}
         self._background: set[asyncio.Task[Any]] = set()
 
     # ----- lifecycle -----
@@ -182,12 +191,13 @@ class SessionRuntime:
 
     async def stop(self) -> None:
         """Cancel the task and close every socket (process shutdown)."""
-        for t in (self._timer, self._task, *self._background):
+        for t in (self._timer, self._task, *self._pingers.values(), *self._background):
             if t is not None:
                 t.cancel()
         for sock in list(self.sockets.values()):
             await self._close(sock, CLOSE_OVER, "server shutting down")
         self.sockets.clear()
+        self._pingers.clear()
 
     # ----- inbound API (called from socket handlers; all just enqueue) -----
 
@@ -232,6 +242,8 @@ class SessionRuntime:
             case "tick":
                 self._armed_for = None
                 await self._apply(eng.Tick(), item.at_ms)
+            case "ping":
+                await self._on_ping(item)
             case "report_done":
                 await self._send(item.player_id or "", item.payload)
 
@@ -315,6 +327,7 @@ class SessionRuntime:
         old = self.sockets.get(pid)
         if old is not None and old is not sock:
             await self._close(old, CLOSE_REPLACED, "replaced by a newer connection")
+        self._stop_pinger(pid)
         self.sockets[pid] = sock
         event: eng.Event = (
             eng.Reconnect(pid)  # a no-op if the seat was never absent (replaced socket)
@@ -330,14 +343,51 @@ class SessionRuntime:
             await self._close(sock, CLOSE_REFUSED, "not seated in this game")
             return
         await self._send(pid, proto.state_message(self.state, pid, self.texts))
+        # A new connection is a new path: measure it afresh.
+        self.latency[pid] = latency.RttTracker()
+        self._pingers[pid] = asyncio.create_task(self._ping_loop(pid, sock))
 
     async def _on_disconnect(self, item: _Item) -> None:
         pid = item.player_id or ""
         if self.sockets.get(pid) is not item.socket:
             return  # a replaced or already-dropped socket; nothing changes
         del self.sockets[pid]
+        self._stop_pinger(pid)
         if pid in self.state.players:
             await self._apply(eng.Disconnect(pid), item.at_ms)
+
+    # ----- RTT (§5) -----
+
+    async def _ping_loop(self, pid: str, sock: Socket) -> None:
+        """Queues a `ping` for this socket: a burst on connect, then one
+        every PING_INTERVAL_MS. The game task does the stamping and the
+        sending, so the pings interleave with everything else in order."""
+        for i in range(latency.PING_BURST):
+            if i:
+                await self.clock.sleep_until(self.clock.now_ms() + latency.PING_BURST_GAP_MS)
+            self._put("ping", player_id=pid, socket=sock)
+        while True:
+            await self.clock.sleep_until(self.clock.now_ms() + latency.PING_INTERVAL_MS)
+            self._put("ping", player_id=pid, socket=sock)
+
+    def _stop_pinger(self, pid: str) -> None:
+        task = self._pingers.pop(pid, None)
+        if task is not None:
+            task.cancel()
+
+    async def _on_ping(self, item: _Item) -> None:
+        pid = item.player_id or ""
+        if self.sockets.get(pid) is not item.socket:
+            return  # queued for a socket that has since gone
+        stamp = self.latency[pid].ping(self.clock.now_ms())
+        await self._send(pid, proto.PingOut(server_ms=stamp))
+
+    def _rtt_ms(self, player_id: str) -> int:
+        """The player's rolling median round trip, 0 until measured. Half
+        of it comes off the recorded response time (§5) — telemetry and
+        the tiebreak, never a scoring input."""
+        tracker = self.latency.get(player_id)
+        return tracker.rtt_ms if tracker is not None else 0
 
     # ----- messages -----
 
@@ -353,6 +403,11 @@ class SessionRuntime:
         match msg:
             case proto.SyncIn():
                 await self._send(pid, proto.SyncReply(client_ms=msg.client_ms, server_ms=item.at_ms))
+            case proto.PongIn():
+                # Both ends on the server clock: the ping's stamp and the
+                # pong's enqueue stamp. Unknown or stale echoes are dropped.
+                if (tracker := self.latency.get(pid)) is not None:
+                    tracker.pong(msg.server_ms, item.at_ms)
             case proto.ReportIn():
                 self._spawn(self._report(pid, msg))
             case proto.StartIn():
@@ -361,12 +416,6 @@ class SessionRuntime:
                 event = proto.to_event(msg, pid, rtt_ms=self._rtt_ms(pid))
                 assert event is not None
                 await self._apply(event, item.at_ms)
-
-    def _rtt_ms(self, player_id: str) -> int:
-        """Half of this is taken off the recorded response time (§5). A
-        one-way `sync` cannot measure it; until the client reports its
-        round trip, 0 — a telemetry hook, never a scoring input."""
-        return 0
 
     # ----- start -----
 
@@ -420,7 +469,8 @@ class SessionRuntime:
         except Exception:
             log.exception("session %s: could not record the end", self.join_code)
         await self.hooks.on_end(self, ended)
-        for sock in list(self.sockets.values()):
+        for pid, sock in list(self.sockets.items()):
+            self._stop_pinger(pid)
             await self._close(sock, CLOSE_OVER, "game over")
         self.sockets.clear()
         if self._on_finish is not None:

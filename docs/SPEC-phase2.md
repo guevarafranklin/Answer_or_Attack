@@ -143,7 +143,8 @@ All messages are JSON `{ "type": ..., ... }`. Server times are epoch millisecond
 ### Client → server
 | type | fields | when |
 |---|---|---|
-| `sync` | `client_ms` | anytime (clock sync, §5) |
+| `sync` | `client_ms` | anytime — the client's own clock offset (§5) |
+| `pong` | `server_ms` | immediately on every server `ping`, echoing its `server_ms` (§5) |
 | `start` | | host, in LOBBY |
 | `pick` | `category_id` | picker, in PICK |
 | `answer` | `question_id`, `option` (0–3) | QUESTION or BLOCK |
@@ -155,6 +156,7 @@ All messages are JSON `{ "type": ..., ... }`. Server times are epoch millisecond
 | type | notes |
 |---|---|
 | `sync_reply` | `client_ms`, `server_ms` |
+| `ping` | `server_ms` — echo as `pong` at once; a burst of 5 on connect, then one every 15 s (§5) |
 | `lobby` | players list, host, config summary |
 | `phase` | `{phase, round, deadline_ms, ...}` — every transition |
 | `board` | categories offered + picker id (PICK) |
@@ -177,11 +179,20 @@ Reconnecting clients receive a full `state` message built by the same per-recipi
 
 This is the highest-risk part of the project. Build and test it before polishing anything else.
 
-- **Clock sync.** On connect the client sends 5 `sync` messages; for each, `offset = server_ms − (client_send + client_recv)/2`. Use the offset from the sample with the lowest round-trip time. Re-sync every 30s. The client renders every countdown against `deadline_ms − offset`.
-- **Acceptance rule.** The server stamps each answer on receipt. An answer counts if `received_ms ≤ deadline_ms + grace_ms`. No client timestamps are trusted.
+Two measurements, two owners. The **server measures each player's round trip** itself and uses it for telemetry and the tiebreak; the **client measures its own clock offset** and uses it only to draw the countdown. Nothing from a client's clock ever reaches scoring or acceptance.
+
+- **Server RTT (`ping`/`pong`).** On connect the runtime sends 5 `ping {server_ms}` messages 250 ms apart, then one every 15 s. The client echoes each as `pong {server_ms}` immediately, adding nothing. The runtime computes `rtt = pong_received_ms − server_ms` with both stamps on its own clock (the ping's stamp is the send time, the pong's stamp is its enqueue time), keeps the last 7 samples per player and uses their **median** as the player's RTT — so one stalled sample does not move it and a sustained change does. A pong is ignored if it echoes a stamp that was never sent, was already echoed, or is older than 30 s; a client can therefore only make its own RTT look *larger*, never smaller, and never negative. A new socket for the same seat starts a fresh measurement. Until the first sample the RTT is 0.
+- **Client offset (`sync`/`sync_reply`).** For the countdown only. The client sends `sync {client_ms}`; the server replies `sync_reply {client_ms, server_ms}` with `server_ms` stamped on receipt. The client algorithm, for the web and mobile clients alike:
+  1. On connect send 5 `sync` messages, each with `client_ms = now()` — any clock the client reads consistently (`Date.now()` on the web), in ms — ~100 ms apart.
+  2. For each reply: `rtt = client_recv − client_ms`; `offset = server_ms − (client_ms + client_recv) / 2`.
+  3. Keep the offset from the sample with the **lowest rtt** (not the average: the shortest trip is the least skewed).
+  4. Re-sync every 30 s the same way. Adopt the new offset if its best sample's rtt is no worse than the one in use, or if the one in use is older than 60 s (so a drifting clock is still corrected).
+  5. Render every countdown as `deadline_ms − (now() + offset)`. Show the countdown reaching 0 at `deadline_ms`; the server's grace is invisible to the player.
+  The client's `sync` cadence is its own business; the server answers every `sync` and never acts on it.
+- **Acceptance rule.** The server stamps each answer on receipt — the stamp is put on the message when it is taken off the socket and enqueued, before anything else in the queue is applied, so a busy runtime cannot make an answer late. An answer counts if `received_ms ≤ deadline_ms + grace_ms`. No client timestamps are trusted.
 - **Why grace, not client time:** trusting client timestamps lets a modified client answer after seeing others react. A fixed grace window is honest and simple. `grace_ms` is tuned in playtests with the latency bots (§8).
-- **The phase ends at `deadline_ms + grace_ms`,** not at `deadline_ms`, so late-but-valid answers are never cut off. If every present player has answered, the phase ends early.
-- **Response time** recorded for telemetry = `received_ms − question_sent_ms` minus half the player's measured RTT.
+- **The phase ends at `deadline_ms + grace_ms`,** not at `deadline_ms`, so late-but-valid answers are never cut off: the runtime's timer ticks at `phase_end_ms = deadline_ms + grace_ms`, and the tick is queued behind any answer that arrived first. If every present player has answered, the phase ends early. REVEAL takes no input and ends at its deadline.
+- **Response time** recorded for telemetry and used by the tiebreak = `max(0, received_ms − question_sent_ms − rtt / 2)`, with the player's median RTT at the moment the answer is applied. It never affects points.
 
 ---
 

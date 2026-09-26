@@ -13,6 +13,7 @@ through the runtime's Clock, so a full game takes about a second.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,7 +30,7 @@ from app.auth import PLAYER_HEADER
 from app.config import settings
 from app.db import get_db
 from app.game import engine as eng
-from app.game import runtime
+from app.game import latency, runtime
 from app.game.config import GameConfig
 from app.main import app
 from app.models import Category, GameSession, Question, QuestionReport, SessionPlayer, SessionQuestion, User
@@ -161,8 +162,13 @@ async def live(migrated_db: str, monkeypatch: pytest.MonkeyPatch):
 
 
 async def settled(rt: runtime.SessionRuntime) -> None:
-    """Everything enqueued so far has been applied."""
-    await rt.queue.join()
+    """Everything enqueued so far has been applied — including what a
+    task woken by the last item (a pinger, the timer) enqueued at once."""
+    while True:
+        await rt.queue.join()
+        await asyncio.sleep(0)
+        if rt.queue.empty():
+            return
 
 
 # ---------- a client that plays ----------
@@ -195,6 +201,8 @@ class Bot:
     async def react(self, m: dict[str, Any]) -> None:
         assert self.ws is not None
         match m["type"]:
+            case "ping":  # even a lazy client echoes pings (§5)
+                await self.ws.send({"type": "pong", "server_ms": m["server_ms"]})
             case "lobby" | "state":
                 self.players = [p["player_id"] for p in m["players"]]
                 if m["type"] == "state" and m["end"]:
@@ -632,8 +640,6 @@ class FakeSocket:
         self.closed: tuple[int, str | None] | None = None
 
     async def send_text(self, data: str) -> None:
-        import json
-
         self.sent.append(json.loads(data))
 
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
@@ -643,43 +649,91 @@ class FakeSocket:
         return [m for m in self.sent if m["type"] == kind]
 
 
+@dataclass
+class Manual:
+    """A runtime driven directly, on a clock the test moves by hand, with
+    fake sockets: for anything where the exact millisecond matters."""
+
+    rt: runtime.SessionRuntime
+    clock: ManualClock
+    socks: dict[str, FakeSocket]
+
+    @property
+    def pids(self) -> list[str]:
+        return list(self.socks)
+
+    def send(self, pid: str, message: dict[str, Any]) -> None:
+        self.rt.receive(pid, json.dumps(message))
+
+    async def tick_to(self, at_ms: int) -> None:
+        self.clock.set(at_ms)
+        await settled(self.rt)
+
+    async def start(self) -> None:
+        self.send(self.pids[0], {"type": "start"})
+        await settled(self.rt)
+        assert self.rt.state.phase is eng.Phase.PICK
+
+    async def pick(self) -> str:
+        """The picker picks the first category; the open question's id."""
+        picker = self.rt.state.picker_id
+        assert picker is not None
+        board = self.socks[picker].of("board")[-1]
+        self.send(picker, {"type": "pick", "category_id": board["category_ids"][0]})
+        await settled(self.rt)
+        assert self.rt.state.phase is eng.Phase.QUESTION and self.rt.state.question is not None
+        return self.rt.state.question.id
+
+    def answer(self, pid: str, qid: str, option: int = 0) -> None:
+        self.send(pid, {"type": "answer", "question_id": qid, "option": option})
+
+    async def pong(self, pid: str, index: int, delay_ms: int) -> None:
+        """Echo this player's `index`-th ping after `delay_ms` of server
+        time — advancing the clock in burst-gap steps until it is sent."""
+        while len(self.socks[pid].of("ping")) <= index:
+            await self.tick_to(self.clock.t + latency.PING_BURST_GAP_MS)
+        stamp = self.socks[pid].of("ping")[index]["server_ms"]
+        self.clock.set(stamp + delay_ms)
+        self.send(pid, {"type": "pong", "server_ms": stamp})
+        await settled(self.rt)
+
+
+async def manual(live: World, **overrides: Any) -> Manual:
+    cat = await live.bank()
+    users = [await live.user(n) for n in ("a", "b", "c")]
+    code = await live.lobby(users[0], cat, **overrides)
+    session = await live.session(code)
+    clock = ManualClock()
+    rt = runtime.SessionRuntime(session.id, code, GameConfig.from_overrides(session.config_overrides), clock=clock)
+    rt.start_task()
+    socks: dict[str, FakeSocket] = {}
+    for u, name in zip(users, "abc"):
+        await live.seat(u, code, name)
+        socks[str(u)] = FakeSocket()
+        rt.connect(str(u), name, socks[str(u)], as_host=u == users[0])
+    await settled(rt)
+    return Manual(rt, clock, socks)
+
+
 @pytest.mark.asyncio
 async def test_events_in_the_same_millisecond_are_applied_in_queue_order(live: World):
     """Two attackers, one target, room for one attack: whoever's message
     was enqueued first wins, and a same-millisecond stamp changes nothing.
     Run twice with the arrival order swapped."""
     for first_wins in (0, 1):
-        cat = await live.bank()
-        users = [await live.user(n) for n in ("a", "b", "c")]
-        code = await live.lobby(users[0], cat, max_incoming_attacks=1, question_count=2)
-        session = await live.session(code)
-        clock = ManualClock()
-        rt = runtime.SessionRuntime(session.id, code, GameConfig.from_overrides(session.config_overrides), clock=clock)
-        rt.start_task()
-        socks = {}
-        for u, name in zip(users, "abc"):
-            await live.seat(u, code, name)
-            socks[str(u)] = FakeSocket()
-            rt.connect(str(u), name, socks[str(u)], as_host=u == users[0])
-        a, b, c = (str(u) for u in users)
-        await settled(rt)
-        rt.receive(a, '{"type": "start"}')
-        await settled(rt)
-        assert rt.state.phase is eng.Phase.PICK
+        m = await manual(live, max_incoming_attacks=1, question_count=2)
+        rt, clock, socks = m.rt, m.clock, m.socks
+        a, b, c = m.pids
+        await m.start()
         # Everyone holds a token, so the attack window opens after the reveal.
         for p in rt.state.players.values():
             p.tokens = 1
-        board = socks[rt.state.picker_id].of("board")[-1]  # type: ignore[index]
-        rt.receive(rt.state.picker_id, f'{{"type": "pick", "category_id": "{board["category_ids"][0]}"}}')  # type: ignore[arg-type]
-        await settled(rt)
-        qid = rt.state.question.id  # type: ignore[union-attr]
+        qid = await m.pick()
         for pid in (a, b, c):
-            rt.receive(pid, f'{{"type": "answer", "question_id": "{qid}", "option": 0}}')
+            m.answer(pid, qid)
         await settled(rt)
         assert rt.state.phase is eng.Phase.REVEAL
-        clock.set(rt.state.phase_end_ms)  # type: ignore[arg-type]
-        await asyncio.sleep(0)
-        await settled(rt)
+        await m.tick_to(rt.state.phase_end_ms)  # type: ignore[arg-type]
         assert rt.state.phase is eng.Phase.ATTACK
 
         order = (a, b) if first_wins == 0 else (b, a)
@@ -694,3 +748,221 @@ async def test_events_in_the_same_millisecond_are_applied_in_queue_order(live: W
         assert socks[loser].of("error")[-1]["code"] == "target_full"
         assert not socks[winner].of("error")
         await rt.stop()
+
+
+# ---------- §5: server-measured RTT ----------
+
+
+@pytest.mark.asyncio
+async def test_rtt_is_the_median_of_pongs_measured_on_the_server_clock(live: World):
+    m = await manual(live)
+    a, b, _ = m.pids
+    # A burst of five pings goes out on connect, spaced by the burst gap.
+    # a's client echoes at once; b's is slow, each pong coming back
+    # after a simulated delay.
+    for i, delay in enumerate([40, 60, 50, 45, 55]):
+        await m.pong(a, i, 0)
+        await m.pong(b, i, delay)
+    assert len(m.socks[a].of("ping")) == latency.PING_BURST
+    stamps = [p["server_ms"] for p in m.socks[a].of("ping")]
+    assert stamps == sorted(set(stamps))  # distinct and increasing
+    assert list(m.rt.latency[b].samples) == [40, 60, 50, 45, 55]
+    assert m.rt._rtt_ms(b) == 50
+    assert m.rt._rtt_ms(a) == 0  # answered instantly (in server time)
+
+    # Then one every 15 s.
+    await m.tick_to(m.clock.t + latency.PING_INTERVAL_MS)
+    assert len(m.socks[a].of("ping")) == latency.PING_BURST + 1
+    await m.pong(b, latency.PING_BURST, 30)
+    assert list(m.rt.latency[b].samples) == [40, 60, 50, 45, 55, 30]
+    # Pings and pongs are no game events: nobody was told anything.
+    assert not any(sock.of("error") for sock in m.socks.values())
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_rtt_median_resists_one_outlier(live: World):
+    m = await manual(live)
+    a = m.pids[0]
+    for i, delay in enumerate([40, 40, 900, 40, 40]):
+        await m.pong(a, i, delay)
+    assert m.rt._rtt_ms(a) == 40
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_pongs_for_unknown_or_stale_pings_are_ignored(live: World):
+    m = await manual(live)
+    a = m.pids[0]
+    await m.pong(a, 0, 30)
+    assert list(m.rt.latency[a].samples) == [30]
+    sent = m.socks[a].of("ping")[0]["server_ms"]
+
+    m.send(a, {"type": "pong", "server_ms": sent + 12_345})  # never sent
+    m.send(a, {"type": "pong", "server_ms": sent})  # already echoed
+    m.send(a, {"type": "pong", "server_ms": sent - 1})  # forged: would read as a negative trip
+    await settled(m.rt)
+    assert list(m.rt.latency[a].samples) == [30]
+
+    # A ping left unanswered for too long is forgotten: echoing it late
+    # cannot plant a huge sample.
+    await m.pong(a, 1, 0)
+    await m.tick_to(m.clock.t + latency.PING_BURST_GAP_MS)  # the third ping goes out ...
+    stale = m.socks[a].of("ping")[2]["server_ms"]  # ... and is left unanswered
+    await m.tick_to(stale + latency.STALE_MS + 1)
+    m.send(a, {"type": "pong", "server_ms": stale})
+    await settled(m.rt)
+    assert list(m.rt.latency[a].samples) == [30, 0]
+    assert not m.socks[a].of("error")
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_new_socket_measures_afresh_and_a_replaced_one_stops_being_pinged(live: World):
+    m = await manual(live)
+    a = m.pids[0]
+    await m.pong(a, 0, 500)
+    assert m.rt._rtt_ms(a) == 500
+    old = m.socks[a]
+    new = FakeSocket()
+    m.rt.connect(a, "a", new, as_host=True)
+    await settled(m.rt)
+    assert old.closed is not None and old.closed[0] == runtime.CLOSE_REPLACED
+    assert m.rt._rtt_ms(a) == 0 and len(new.of("ping")) == 1
+    pings_to_old = len(old.of("ping"))
+    for _ in range(latency.PING_BURST - 1):
+        await m.tick_to(m.clock.t + latency.PING_BURST_GAP_MS)
+    await m.tick_to(m.clock.t + latency.PING_INTERVAL_MS)
+    assert len(old.of("ping")) == pings_to_old
+    assert len(new.of("ping")) == latency.PING_BURST + 1
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_clients_are_pinged_on_connect_and_their_echo_is_measured(live: World):
+    code, bots = await three_seats(live)
+    host = bots[0].ws
+    assert host is not None
+    await host.recv_type("state")
+    ping = await host.recv_type("ping")
+    assert ping["server_ms"] > 0
+    await host.send({"type": "pong", "server_ms": ping["server_ms"]})
+    await host.send({"type": "sync", "client_ms": 1})
+    await host.recv_type("sync_reply")
+    rt = live.runtime(code)
+    await settled(rt)
+    assert len(rt.latency[bots[0].player_id].samples) == 1
+    assert 0 <= rt._rtt_ms(bots[0].player_id) < 1000 * SPEED
+
+
+# ---------- §5: acceptance at deadline + grace ----------
+
+
+@pytest.mark.asyncio
+async def test_answers_are_judged_by_their_enqueue_stamp(live: World):
+    """An answer stamped at deadline+grace-1 on arrival is accepted even
+    if the queue only gets to it after the window has passed."""
+    m = await manual(live, grace_ms=1500)
+    a, b, c = m.pids
+    await m.start()
+    qid = await m.pick()
+    s = m.rt.state
+    assert s.deadline_ms is not None and s.phase_end_ms == s.deadline_ms + 1500
+    assert m.socks[a].of("question")[-1]["deadline_ms"] == s.deadline_ms
+    end = s.phase_end_ms
+
+    m.clock.set(end - 1)
+    m.answer(a, qid)  # stamped end-1 on enqueue ...
+    m.clock.set(end + 5_000)  # ... the clock moves on before it is applied
+    await settled(m.rt)
+    assert m.socks[a].of("answer_ack")[-1] == {"type": "answer_ack", "question_id": qid, "accepted": True, "reason": None}
+    assert m.rt.state.answers[a].received_ms == end - 1
+    # The timer's tick (stamped after the answer) then closed the question.
+    assert m.rt.state.phase is eng.Phase.REVEAL
+    assert m.socks[a].of("reveal")[-1]["outcome"] in ("correct", "incorrect")
+    assert m.socks[b].of("reveal")[-1]["outcome"] == "timeout"
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_answer_at_deadline_plus_grace_minus_one_is_accepted_and_plus_one_is_too_late(live: World):
+    m = await manual(live, grace_ms=400)
+    a, b, c = m.pids
+    await m.start()
+    qid = await m.pick()
+    end = m.rt.state.phase_end_ms
+    assert end is not None and end == m.rt.state.deadline_ms + 400
+
+    await m.tick_to(end - 1)
+    m.answer(a, qid)
+    await settled(m.rt)
+    assert m.socks[a].of("answer_ack")[-1]["accepted"] is True
+    assert m.rt.state.phase is eng.Phase.QUESTION  # b and c still may answer
+
+    m.clock.set(end + 1)
+    m.answer(b, qid)  # queued before the timer wakes for `end`
+    await settled(m.rt)
+    ack = m.socks[b].of("answer_ack")[-1]
+    assert ack["accepted"] is False and ack["reason"] == "too_late"
+    assert m.rt.state.phase is eng.Phase.REVEAL
+    outcomes = {pid: m.socks[pid].of("reveal")[-1]["outcome"] for pid in (a, b, c)}
+    assert outcomes[a] in ("correct", "incorrect") and outcomes[b] == outcomes[c] == "timeout"
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_question_ends_at_deadline_plus_grace_unless_everyone_answered(live: World):
+    m = await manual(live, grace_ms=400, question_count=2)
+    a, b, c = m.pids
+    await m.start()
+    qid = await m.pick()
+    deadline, end = m.rt.state.deadline_ms, m.rt.state.phase_end_ms
+    assert deadline is not None and end == deadline + 400
+    # Nobody answers: the deadline itself changes nothing, the grace does.
+    await m.tick_to(deadline)
+    assert m.rt.state.phase is eng.Phase.QUESTION
+    await m.tick_to(end - 1)
+    assert m.rt.state.phase is eng.Phase.QUESTION
+    await m.tick_to(end)
+    assert m.rt.state.phase is eng.Phase.REVEAL
+    assert m.socks[a].of("phase")[-1]["phase"] == "reveal"
+
+    # Round 2: everyone answers well before the deadline, and the phase
+    # closes at once.
+    await m.tick_to(m.rt.state.phase_end_ms)  # type: ignore[arg-type]
+    while m.rt.state.phase is not eng.Phase.PICK:  # no tokens were earned: no attack window
+        await m.tick_to(m.rt.state.phase_end_ms)  # type: ignore[arg-type]
+    assert m.rt.state.round == 2
+    qid = await m.pick()
+    deadline = m.rt.state.deadline_ms
+    assert deadline is not None
+    await m.tick_to(deadline - 5_000)
+    for pid in (a, b, c):
+        m.answer(pid, qid)
+    await settled(m.rt)
+    assert m.rt.state.phase is eng.Phase.REVEAL and m.clock.t == deadline - 5_000
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_response_time_takes_off_half_the_measured_rtt(live: World):
+    m = await manual(live)
+    a, b, c = m.pids
+    for i in range(5):
+        await m.pong(a, i, 100)  # a: RTT 100
+        await m.pong(c, i, 5_000)  # c: a terrible link
+    assert m.rt._rtt_ms(a) == 100 and m.rt._rtt_ms(b) == 0 and m.rt._rtt_ms(c) == 5_000
+    await m.start()
+    qid = await m.pick()
+    sent = m.rt.state.question_sent_ms
+    assert sent == m.clock.t
+    await m.tick_to(sent + 1_000)
+    for pid in (a, b, c):
+        m.answer(pid, qid)
+    await settled(m.rt)
+    answers = m.rt.state.answers
+    assert all(ans.received_ms == sent + 1_000 for ans in answers.values())
+    assert answers[a].response_ms == 950
+    assert answers[b].response_ms == 1_000
+    assert answers[c].response_ms == 0  # floored, never negative
+    await m.rt.stop()

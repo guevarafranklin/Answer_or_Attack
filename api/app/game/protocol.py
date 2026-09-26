@@ -2,10 +2,11 @@
 
 Two halves:
 
-* **Inbound** — one Pydantic model per client message (`sync`, `start`,
-  `pick`, `answer`, `attack`, `pass`, `report`), a discriminated union
-  on `type`, and `to_event` turning one into an engine event. `sync` and
-  `report` are not game events: the runtime answers them itself.
+* **Inbound** — one Pydantic model per client message (`sync`, `pong`,
+  `start`, `pick`, `answer`, `attack`, `pass`, `report`), a
+  discriminated union on `type`, and `to_event` turning one into an
+  engine event. `sync`, `pong` and `report` are not game events: the
+  runtime answers them itself.
 
 * **Outbound** — one model per server message, and `fan_out`, which
   takes the engine's messages plus the state they produced and returns,
@@ -83,8 +84,18 @@ Texts = Mapping[str, QuestionText]
 
 
 class SyncIn(_Strict):
+    """Client-initiated: for the client's own clock offset (§5)."""
+
     type: Literal["sync"]
     client_ms: int
+
+
+class PongIn(_Strict):
+    """The echo of a server `ping`, for the server's RTT measurement (§5).
+    The client adds nothing of its own."""
+
+    type: Literal["pong"]
+    server_ms: int
 
 
 class StartIn(_Strict):
@@ -122,7 +133,7 @@ class ReportIn(_Strict):
 
 
 ClientMessage = Annotated[
-    SyncIn | StartIn | PickIn | AnswerIn | AttackIn | PassIn | ReportIn,
+    SyncIn | PongIn | StartIn | PickIn | AnswerIn | AttackIn | PassIn | ReportIn,
     Field(discriminator="type"),
 ]
 client_message_adapter: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
@@ -137,8 +148,8 @@ def parse_client_message(raw: str | bytes | dict[str, Any]) -> ClientMessage:
 
 
 def to_event(msg: ClientMessage, player_id: str, *, rtt_ms: int = 0) -> eng.Event | None:
-    """The engine event for a game message; None for `sync` and `report`,
-    which the runtime handles without the engine."""
+    """The engine event for a game message; None for `sync`, `pong` and
+    `report`, which the runtime handles without the engine."""
     match msg:
         case StartIn():
             return eng.Start(player_id)
@@ -172,6 +183,13 @@ class PlayerView(_Strict):
 class SyncReply(_Strict):
     type: Literal["sync_reply"] = "sync_reply"
     client_ms: int
+    server_ms: int
+
+
+class PingOut(_Strict):
+    """Echo it back as `pong {server_ms}` immediately (§5)."""
+
+    type: Literal["ping"] = "ping"
     server_ms: int
 
 
@@ -344,6 +362,7 @@ class StateOut(_Strict):
 
 ServerMessage = (
     SyncReply
+    | PingOut
     | LobbyOut
     | PhaseOut
     | BoardOut
