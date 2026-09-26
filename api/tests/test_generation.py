@@ -15,7 +15,7 @@ from app.models import Category, GenerationJob, Question, QuestionTranslation
 from app.queue import GENERATE_JOB, get_queue
 from app.schemas.generation import GenerationParams
 from app.services import validation as v
-from app.services.generator import StubGenerator, get_generator
+from app.services.generator import GeneratedChunk, StubGenerator, get_generator, topic_summary
 from app.services.validation import content_hash
 from app.workers.generation import CHUNK_SIZE, chunk_sizes, generate_questions
 from tests.test_validation import item
@@ -42,12 +42,14 @@ class ListGenerator:
 
     def __init__(self, chunks: list[list[Any] | Exception]):
         self.chunks = chunks
+        self.avoid_seen: list[list[str]] = []  # the `avoid` hint passed per call
 
-    async def generate(self, params, count, chunk_index):
+    async def generate(self, params, count, chunk_index, avoid=()):
+        self.avoid_seen.append(list(avoid))
         chunk = self.chunks[chunk_index]
         if isinstance(chunk, Exception):
             raise chunk
-        return chunk
+        return GeneratedChunk(chunk)
 
 
 @pytest.fixture
@@ -185,6 +187,8 @@ async def test_get_job_and_list(client: AsyncClient, admin_headers, db: AsyncSes
         "chunks_total": 0,
         "chunks_failed": 0,
         "chunk_errors": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
     }
 
     resp = await client.get("/admin/generate", headers=admin_headers)
@@ -207,7 +211,7 @@ def test_get_generator_defaults_to_stub():
 @pytest.mark.asyncio
 async def test_stub_chunk_zero_hits_every_rejection_rule():
     p = GenerationParams(category_slug="math", count=CHUNK_SIZE)
-    items = await StubGenerator().generate(p, CHUNK_SIZE, 0)
+    items = (await StubGenerator().generate(p, CHUNK_SIZE, 0)).items
     assert len(items) == CHUNK_SIZE
 
     codes: set[str] = set()
@@ -237,7 +241,7 @@ async def test_stub_later_chunks_are_clean_and_respect_params():
     p = GenerationParams(
         category_slug="math", count=30, difficulty_min=2, difficulty_max=3, grade_bands=["g4_g6"]
     )
-    items = await StubGenerator().generate(p, 10, 1)
+    items = (await StubGenerator().generate(p, 10, 1)).items
     assert len(items) == 10
     for raw in items:
         clean = v.validate_item(raw)
@@ -482,3 +486,28 @@ async def test_nothing_is_ever_inserted_as_live(db: AsyncSession):
         await db.execute(select(func.count()).select_from(Question).where(Question.status == "live"))
     ).scalar_one()
     assert live == 0
+
+
+@pytest.mark.asyncio
+async def test_accepted_topics_are_passed_to_later_chunks_as_avoid_hints(db: AsyncSession):
+    """Each chunk gets the topic summaries of everything accepted so far —
+    rejected items contribute nothing."""
+    await _category(db)
+    job = await _job(db, 45)  # chunks: 20, 20, 5
+    bad = item(difficulty=0)
+    gen = ListGenerator([[good(1), bad], [good(2)], []])
+    await _run(db, job, gen)
+
+    q1, q2 = v.validate_item(good(1)), v.validate_item(good(2))
+    assert isinstance(q1, v.CleanItem) and isinstance(q2, v.CleanItem)
+    t1, t2 = topic_summary(q1), topic_summary(q2)
+    assert t1 == f"{', '.join(q1.tags)}: {q1.translations['en'].options[q1.correct_index]}"
+    assert gen.avoid_seen == [[], [t1], [t1, t2]]
+
+
+@pytest.mark.asyncio
+async def test_stub_job_costs_nothing(db: AsyncSession):
+    await _category(db)
+    job = await _run(db, await _job(db, 3), ListGenerator([[good(1), good(2), good(3)]]))
+    assert job.cost_cents == 0
+    assert (job.stats["input_tokens"], job.stats["output_tokens"]) == (0, 0)

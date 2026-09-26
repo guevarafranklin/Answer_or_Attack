@@ -335,7 +335,8 @@ GET    /admin/generate?limit=50     → recent jobs, newest first
   "rejections":   {"stem_too_long:es": 3, "duplicate_in_batch": 1},
   "emitted": 20, "repeated": 1, "repeat_rate": 0.05,
   "chunks_total": 5, "chunks_failed": 1,
-  "chunk_errors": ["chunk 3: RuntimeError: ..."]
+  "chunk_errors": ["chunk 3: GeneratorError: malformed JSON: ..."],
+  "input_tokens": 41200, "output_tokens": 63800
 }
 ```
 
@@ -427,7 +428,8 @@ The admin types natural language ("Create 100 math questions from first grade to
 5. Insert survivors as `status='pending'`, tagged with `generation_job_id`.
 6. Update counts, set the final status, record `cost_cents`, and write `stats`:
    - `succeeded` if every produced item was accepted; `partial` if any item was rejected or any chunk failed; `failed` if nothing was accepted.
-   - `stats` (JSONB): `rejections` (reason code → count, one count per code per item, so a multi-fault item appears under each of its codes), `emitted` / `repeated` / `repeat_rate` (how often the generator repeated an `en` stem across the whole job, counted on every emission whether or not it was accepted), `chunks_total`, `chunks_failed`, `chunk_errors`.
+   - `stats` (JSONB): `rejections` (reason code → count, one count per code per item, so a multi-fault item appears under each of its codes), `emitted` / `repeated` / `repeat_rate` (how often the generator repeated an `en` stem across the whole job, counted on every emission whether or not it was accepted), `chunks_total`, `chunks_failed`, `chunk_errors`, `input_tokens` / `output_tokens` (the raw usage behind `cost_cents`, summed over every call the job made, including calls whose chunk then failed).
+   - `cost_cents` = token usage × the configured list price of `GENERATOR_MODEL` (`GENERATOR_PRICE_INPUT_PER_MTOK` / `GENERATOR_PRICE_OUTPUT_PER_MTOK`, USD per million tokens), rounded. `0` for the stub backend.
    - `error` is the human-readable summary of the same: top rejection reasons with counts, repeat rate, chunk failures. `NULL` when the job was clean.
 
 Rejected items are counted, not stored. Rejection reason codes are stable strings (`stem_too_long:es`, `correct_index_invalid`, `duplicate_in_batch`, …) so the admin UI can group on them — that is how you notice a bad prompt.
@@ -439,6 +441,10 @@ Rejected items are counted, not stored. Rejection reason codes are stable string
 - Forbid "all of the above" / "none of the above".
 - Forbid questions whose answer changes over time ("current president") unless `tags` includes `time_sensitive`.
 - For Spanish, translate the *question*, don't transliterate — regionalisms should read naturally to both Mexican and Central American speakers.
+
+The Claude backend (`GENERATOR_BACKEND=claude`, `app/services/claude_generator.py`) puts this guidance and the §5.2 limits in the system prompt, and the job params (difficulty range, grade bands, region, style notes) in the per-chunk user message. Each chunk is one Messages API call asking for both locales as strict JSON (structured outputs enforce the §5.2 shape; `GENERATOR_STRUCTURED_OUTPUT=false` turns that off for a model without support). Later chunks also get a "don't repeat these topics" list — the `tags: answer` summary of every item the job has accepted so far, not the stems — so a 200-question job doesn't circle back to the same facts.
+
+Per-chunk failure policy: a transient API error (connection/timeout, 429, 5xx) is retried once after a backoff (honouring `Retry-After`); any other API error or a response that isn't the expected JSON fails the chunk immediately, with no retry. The usage a failed call consumed still counts toward `cost_cents`. The stub backend (`GENERATOR_BACKEND=stub`, the default) never touches the network.
 
 ---
 

@@ -66,6 +66,10 @@ class GenerationStats(BaseModel):
     chunks_total: int = 0
     chunks_failed: int = 0
     chunk_errors: list[str] = Field(default_factory=list)
+    # Raw model usage behind cost_cents, so the cost can be re-derived when
+    # prices change.
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class GenerationJobRead(ORMModel):

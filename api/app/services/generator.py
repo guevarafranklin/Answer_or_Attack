@@ -3,17 +3,56 @@
 A Generator turns job params into raw items in the §5.2 JSON shape, one
 chunk at a time. It returns whatever the backend produced — validation is
 the worker's job, not the generator's — and may raise; the worker treats an
-exception as that chunk failing and carries on with the rest.
+exception as that chunk failing and carries on with the rest. A backend that
+spent money before failing raises `GeneratorError` with the `usage` attached
+so the job's cost stays honest.
 
-`get_generator()` picks the backend from settings.generator_backend. The
-Claude backend is §9 step 5; until then only the stub exists.
+`get_generator()` picks the backend from settings.generator_backend:
+"stub" (fixed items, no network) or "claude" (app.services.claude_generator).
 """
 import copy
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from app.config import settings
 from app.rules import MAX_OPTION_LEN, MAX_STEM_LEN
 from app.schemas.generation import GenerationParams
+from app.services.validation import CleanItem
+
+TOPIC_SUMMARY_MAX_LEN = 80
+
+
+@dataclass
+class Usage:
+    """Token usage and its price for one or more model calls. The backend
+    prices its own calls; the worker only sums."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_cents: float = 0.0
+
+    def __add__(self, other: "Usage") -> "Usage":
+        return Usage(
+            self.input_tokens + other.input_tokens,
+            self.output_tokens + other.output_tokens,
+            self.cost_cents + other.cost_cents,
+        )
+
+
+@dataclass
+class GeneratedChunk:
+    #: Raw items in the §5.2 shape — unvalidated, possibly not even dicts.
+    items: list[Any]
+    usage: Usage = field(default_factory=Usage)
+
+
+class GeneratorError(Exception):
+    """The chunk failed. `usage` is what the failed attempt(s) still cost."""
+
+    def __init__(self, message: str, usage: Usage | None = None):
+        super().__init__(message)
+        self.usage = usage or Usage()
 
 
 class Generator(Protocol):
@@ -21,10 +60,25 @@ class Generator(Protocol):
     name: str
 
     async def generate(
-        self, params: GenerationParams, count: int, chunk_index: int
-    ) -> list[dict[str, Any]]:
-        """Produce `count` raw items for chunk `chunk_index` of the job."""
+        self,
+        params: GenerationParams,
+        count: int,
+        chunk_index: int,
+        avoid: Sequence[str] = (),
+    ) -> GeneratedChunk:
+        """Produce `count` raw items for chunk `chunk_index` of the job.
+        `avoid` is the topic summaries (see `topic_summary`) of everything the
+        job has accepted so far — a "don't repeat these" hint, not a gate."""
         ...
+
+
+def topic_summary(item: CleanItem) -> str:
+    """Short, model-readable fingerprint of an accepted question for the
+    `avoid` hint: its tags and correct answer ("solar system: Jupiter").
+    Hashes are opaque and full stems are too long to send 200 of."""
+    answer = item.translations["en"].options[item.correct_index]
+    summary = f"{', '.join(item.tags)}: {answer}" if item.tags else answer
+    return summary[:TOPIC_SUMMARY_MAX_LEN]
 
 
 def get_generator() -> Generator:
@@ -32,7 +86,9 @@ def get_generator() -> Generator:
     if backend == "stub":
         return StubGenerator()
     if backend == "claude":
-        raise NotImplementedError("claude generator is §9 step 5")
+        from app.services.claude_generator import ClaudeGenerator
+
+        return ClaudeGenerator.from_settings()
     raise ValueError(f"unknown generator_backend: {backend!r}")
 
 
@@ -127,14 +183,18 @@ class StubGenerator:
     name = "stub"
 
     async def generate(
-        self, params: GenerationParams, count: int, chunk_index: int
-    ) -> list[dict[str, Any]]:
+        self,
+        params: GenerationParams,
+        count: int,
+        chunk_index: int,
+        avoid: Sequence[str] = (),
+    ) -> GeneratedChunk:
         if chunk_index != 0:
             start = chunk_index * 1000
-            return [_good(start + i, params) for i in range(count)]
+            return GeneratedChunk([_good(start + i, params) for i in range(count)])
 
         first = _good(0, params)
         mixed: list[Any] = [first, copy.deepcopy(first)]  # second is duplicate_in_batch
         mixed.extend(_bad_items(params))
         mixed.extend(_good(i, params) for i in range(len(mixed), count))
-        return mixed[:count]
+        return GeneratedChunk(mixed[:count])

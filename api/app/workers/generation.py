@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Category, GenerationJob, Question, QuestionTranslation
 from app.schemas.generation import GenerationParams, GenerationStats
 from app.services.categories import get_category_by_slug
-from app.services.generator import Generator
+from app.services.generator import Generator, GeneratorError, Usage, topic_summary
 from app.services.validation import (
     DUPLICATE_OF_EXISTING,
     CleanItem,
@@ -65,12 +65,19 @@ class _Tally:
         self.reasons: Counter[str] = Counter()
         self.repeats = RepeatCounter()
         self.seen_accepted: set[str] = set()
+        # "Don't repeat these" hints for the generator, one per accepted item.
+        self.topics: list[str] = []
+        self.usage = Usage()
         self.chunks_total = 0
         self.chunk_errors: list[str] = []
 
     def reject(self, codes: list[str]) -> None:
         self.rejected += 1
         self.reasons.update(codes)
+
+    def accept(self, item: CleanItem) -> None:
+        self.accepted += 1
+        self.topics.append(topic_summary(item))
 
     def status(self) -> str:
         if self.accepted == 0:
@@ -88,6 +95,8 @@ class _Tally:
             chunks_total=self.chunks_total,
             chunks_failed=len(self.chunk_errors),
             chunk_errors=self.chunk_errors,
+            input_tokens=self.usage.input_tokens,
+            output_tokens=self.usage.output_tokens,
         ).model_dump()
 
     def error_summary(self) -> str | None:
@@ -108,6 +117,7 @@ class _Tally:
         job.produced_count = self.produced
         job.accepted_count = self.accepted
         job.rejected_count = self.rejected
+        job.cost_cents = round(self.usage.cost_cents)
         job.stats = self.stats()
         job.error = self.error_summary()
 
@@ -149,12 +159,15 @@ async def run_job(db: AsyncSession, generator: Generator, job_id: uuid.UUID) -> 
         for chunk_index, size in enumerate(chunk_sizes(params.count)):
             tally.chunks_total += 1
             try:
-                items = await generator.generate(params, size, chunk_index)
+                chunk = await generator.generate(params, size, chunk_index, avoid=tally.topics)
             except Exception as exc:  # one bad chunk must not lose the others
                 log.exception("job %s chunk %d failed", job_id, chunk_index)
                 tally.chunk_errors.append(f"chunk {chunk_index}: {type(exc).__name__}: {exc}")
-                continue
-            await _process_chunk(db, job, category, params, items, tally)
+                if isinstance(exc, GeneratorError):
+                    tally.usage += exc.usage  # the failed call still cost money
+            else:
+                tally.usage += chunk.usage
+                await _process_chunk(db, job, category, params, chunk.items, tally)
             tally.apply_to(job)  # progress is visible to the polling admin panel
             await db.commit()
     except Exception as exc:
@@ -202,7 +215,7 @@ async def _process_chunk(
             # Lost a race on questions_house_hash_uniq with another writer.
             tally.reject([DUPLICATE_OF_EXISTING])
             continue
-        tally.accepted += 1
+        tally.accept(result)
 
 
 def _question_row(
