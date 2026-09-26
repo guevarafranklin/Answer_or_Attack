@@ -440,7 +440,11 @@ Rejected items are counted, not stored. Rejection reason codes are stable string
 - Distractors must be plausible and the same category of thing as the answer (all years, all names, all numbers).
 - Forbid "all of the above" / "none of the above".
 - Forbid questions whose answer changes over time ("current president") unless `tags` includes `time_sensitive`.
-- For Spanish, translate the *question*, don't transliterate — regionalisms should read naturally to both Mexican and Central American speakers.
+- For Spanish, write the question, don't translate it: natural Spanish word order, ¿ where the question itself begins, no English-style gerunds, standard Spanish spellings of names (Gengis Kan, Keops). Neutral Latin American Spanish that reads naturally to both Mexican and Central American speakers.
+- Difficulty is judged by how many adults would answer correctly, not by how important the topic is: 1 = most adults (who painted the Mona Lisa), 2 = high-school level (year the Berlin Wall fell), 3 = interested amateur (Byzantine Empire's end, 1453), 4 = enthusiast (year of the Treaty of Westphalia), 5 = specialist.
+- Every distractor must be plausible to someone who half-knows the topic — same era, same region, same type of thing. Nothing eliminable by common sense alone.
+- Answers are facts (names, places, dates, numbers), never periods or classifications ("Medieval history").
+- Variety: at most 3 "what year" questions per 10; vary question forms.
 
 The Claude backend (`GENERATOR_BACKEND=claude`, `app/services/claude_generator.py`) puts this guidance and the §5.2 limits in the system prompt, and the job params (difficulty range, grade bands, region, style notes) in the per-chunk user message. Each chunk is one Messages API call asking for both locales as strict JSON (structured outputs enforce the §5.2 shape; `GENERATOR_STRUCTURED_OUTPUT=false` turns that off for a model without support). Later chunks also get a "don't repeat these topics" list — the `tags: answer` summary of every item the job has accepted so far, not the stems — so a 200-question job doesn't circle back to the same facts.
 

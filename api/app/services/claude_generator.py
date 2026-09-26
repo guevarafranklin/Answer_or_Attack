@@ -20,6 +20,7 @@ exactly one extra request, visible in tests.
 import asyncio
 import json
 import logging
+import math
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -51,6 +52,9 @@ REGION_GUIDANCE = {
 }
 assert set(REGION_GUIDANCE) == set(REGIONS)
 
+# Variety: at most this share of a chunk may be "what year" questions.
+MAX_YEAR_QUESTION_SHARE = 0.3
+
 SYSTEM_PROMPT = f"""You write multiple-choice trivia questions for a fast-paced quiz game. Each question is shown for about ten seconds, so it must be short and instantly readable.
 
 Hard rules — a question that breaks any of these is thrown away:
@@ -58,13 +62,27 @@ Hard rules — a question that breaks any of these is thrown away:
 - Exactly {OPTION_COUNT} options, all distinct, each at most {MAX_OPTION_LEN} characters.
 - Stem at most {MAX_STEM_LEN} characters.
 - explanation: one sentence, at most {MAX_EXPLANATION_LEN} characters, in each locale. Say why the answer is right; nothing more.
-- Distractors must be plausible and the same category of thing as the answer: all years, all names, all numbers.
 - Never use {", ".join(f'"{p}"' for p in FORBIDDEN_PHRASES)} or anything like them.
 - No questions whose answer changes over time ("the current president") unless the question's tags include "time_sensitive".
-- "es" is a translation of the question, not a transliteration. It must read naturally to both Mexican and Central American Spanish speakers; avoid regionalisms that only one of them uses. Keep the options in the same order in both locales, so correct_index applies to both.
 - correct_index is the 0-based position of the correct option. Vary it; do not put the answer in the same position every time.
+- Keep the options in the same order in both locales, so correct_index applies to both.
 - tags: 1–3 short lowercase English topic tags, specific to the question ("algebra", "solar system"), used to tell the questions apart.
-- grade_band: the school level the question suits ({", ".join(GRADE_BANDS)}). difficulty: 1 (easiest) to 5 (hardest) within that level.
+- grade_band: the school level the question suits ({", ".join(GRADE_BANDS)}).
+
+Difficulty — judge by how many adults would answer correctly, not by how important the topic is:
+- 1: most adults know it (who painted the Mona Lisa).
+- 2: high-school level (the year the Berlin Wall fell).
+- 3: an interested amateur knows it (when the Byzantine Empire ended: 1453).
+- 4: an enthusiast knows it (the year of the Treaty of Westphalia).
+- 5: a specialist knows it.
+
+Answers must be facts: names, places, dates, numbers. Never a period or a classification ("Medieval history", "a mammal") as the answer.
+
+Distractors: every distractor must be plausible to someone who half-knows the topic — same era, same region, same type of thing as the answer (all years, all names, all numbers). No option that common sense alone can eliminate.
+
+Spanish ("es") is written, not translated. Compose the Spanish stem with natural Spanish word order; place ¿ where the question itself begins, not necessarily at the start of the sentence; avoid English-style gerunds; use the standard Spanish spellings of names (Gengis Kan, Keops). Neutral Latin American Spanish that reads the same to Mexican and Central American speakers; no regionalisms.
+
+Variety: at most 3 in every 10 questions may ask for a year. Vary the question forms — who, where, which, how many, what is called — and the facts asked for.
 
 Output only a JSON object of the form
 {{"questions": [{{"difficulty": 3, "grade_band": "g7_g9", "tags": ["algebra"], "correct_index": 2,
@@ -110,6 +128,11 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
+def max_year_questions(count: int) -> int:
+    """3 per chunk of 10, rounded up for smaller chunks, never below 1."""
+    return max(1, math.ceil(count * MAX_YEAR_QUESTION_SHARE))
+
+
 def build_user_prompt(params: GenerationParams, count: int, avoid: Sequence[str]) -> str:
     """The per-chunk request: what to write, within which job params, and
     which topics this job already has."""
@@ -124,6 +147,7 @@ def build_user_prompt(params: GenerationParams, count: int, avoid: Sequence[str]
         f"- grade_band: {', '.join(bands)}" + (", spread across them." if len(bands) > 1 else "."),
         f"- region: {params.region}. {REGION_GUIDANCE[params.region]}",
         "- locales: provide both en and es for every question.",
+        f"- at most {max_year_questions(count)} of these {count} questions may ask for a year.",
     ]
     if params.style_notes:
         lines.append(f"- style notes from the editor: {params.style_notes}")

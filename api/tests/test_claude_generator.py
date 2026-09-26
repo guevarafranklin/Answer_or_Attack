@@ -139,18 +139,14 @@ async def test_request_asks_for_strict_json_in_one_call():
     assert req["max_tokens"] == settings.generator_max_tokens == 16000
     assert [m["role"] for m in req["messages"]] == ["user"]
     system = req["system"]
-    # §5.3 guidance and the §5.2 rules live in the system prompt.
+    # The §5.2 limits live in the system prompt.
     for phrase in (
-        "one defensible correct answer",
-        "same category of thing",
-        "all of the above",
-        "time_sensitive",
-        "not a transliteration",
-        "Mexican and Central American",
         "at most 120 characters",
         "at most 60 characters",
         "Exactly 4 options",
         "explanation: one sentence, at most 200 characters",
+        "all of the above",
+        "time_sensitive",
     ):
         assert phrase in system, phrase
     # Both locales in one call, in the §5.2 shape.
@@ -158,6 +154,50 @@ async def test_request_asks_for_strict_json_in_one_call():
     user = req["messages"][0]["content"]
     assert user.startswith("Write exactly 20 questions for the category: science.")
     assert "provide both en and es" in user
+
+
+def test_system_prompt_editorial_guidance():
+    """§5.3 plus the rules from the first real batch review."""
+    system = cg.SYSTEM_PROMPT
+    assert "Exactly one defensible correct answer" in system
+
+    # Difficulty rubric: anchored levels, judged by how many adults know it.
+    assert "judge by how many adults would answer correctly, not by how important the topic is" in system
+    for level, anchor in (
+        (1, "Mona Lisa"), (2, "Berlin Wall"), (3, "1453"), (4, "Treaty of Westphalia"), (5, "specialist"),
+    ):
+        assert f"- {level}: " in system
+        assert anchor in system, anchor
+    assert "within that level" not in system  # old, grade-relative wording is gone
+
+    # Distractors: plausible to a half-expert, nothing eliminable by common sense.
+    assert "plausible to someone who half-knows the topic" in system
+    assert "same era, same region, same type of thing" in system
+    assert "No option that common sense alone can eliminate" in system
+
+    # Answers are facts, not category labels.
+    assert "Answers must be facts: names, places, dates, numbers" in system
+    assert "Medieval history" in system
+
+    # Spanish is written, not translated.
+    assert "written, not translated" in system
+    assert "natural Spanish word order" in system
+    assert "place ¿ where the question itself begins" in system
+    assert "avoid English-style gerunds" in system
+    assert "Gengis Kan, Keops" in system
+    assert "Neutral Latin American Spanish" in system
+    assert "Keep the options in the same order in both locales" in system
+    assert "transliteration" not in system
+
+    # Variety.
+    assert "at most 3 in every 10 questions may ask for a year" in system
+    assert "Vary the question forms" in system
+
+
+@pytest.mark.parametrize("count, cap", [(1, 1), (3, 1), (5, 2), (10, 3), (20, 6)])
+def test_year_question_cap_per_chunk(count, cap):
+    assert cg.max_year_questions(count) == cap
+    assert f"- at most {cap} of these {count} questions may ask for a year." in build_user_prompt(params(), count, [])
 
 
 @pytest.mark.asyncio
