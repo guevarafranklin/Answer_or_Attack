@@ -192,7 +192,7 @@ Two measurements, two owners. The **server measures each player's round trip** i
 - **Acceptance rule.** The server stamps each answer on receipt — the stamp is put on the message when it is taken off the socket and enqueued, before anything else in the queue is applied, so a busy runtime cannot make an answer late. An answer counts if `received_ms ≤ deadline_ms + grace_ms`. No client timestamps are trusted.
 - **Why grace, not client time:** trusting client timestamps lets a modified client answer after seeing others react. A fixed grace window is honest and simple. `grace_ms` is tuned in playtests with the latency bots (§8).
 - **The phase ends at `deadline_ms + grace_ms`,** not at `deadline_ms`, so late-but-valid answers are never cut off: the runtime's timer ticks at `phase_end_ms = deadline_ms + grace_ms`, and the tick is queued behind any answer that arrived first. If every present player has answered, the phase ends early. REVEAL takes no input and ends at its deadline.
-- **Response time** recorded for telemetry and used by the tiebreak = `max(0, received_ms − question_sent_ms − rtt / 2)`, with the player's median RTT at the moment the answer is applied. It never affects points.
+- **Response time** recorded for telemetry and used by the tiebreak = `max(0, received_ms − question_sent_ms − min(rtt / 2, 500))`, with the player's median RTT at the moment the answer is applied. The 500 ms cap bounds what a client that stalls its pongs (inflating its RTT) can gain in the tiebreak. It never affects points.
 
 ---
 
@@ -215,6 +215,8 @@ CREATE TABLE session_events (      -- append-only log for debugging and replays
 );
 ```
 The event log lets you replay any disputed game through the pure engine and get the same result. Write it asynchronously; it must never slow a round.
+
+**Snapshot, resume, replay (step 7, as built).** After every engine step the runtime writes the full engine state, the rng state and the event counter to `session:{id}:state` (TTL 3 h) and appends the event with its enqueue stamp to `session_events`, both through one background writer per session: events are inserted before the snapshot that has seen them, snapshot writes are coalesced to the latest state, and everything is flushed at END (the snapshot is then deleted) and at shutdown. On startup, every `running` session with a snapshot is restored: state and rng loaded, the log rows past the snapshot's seq applied to it through the pure engine (so every step a player saw acknowledged survives the crash; rows past a gap in the log are dropped), then a `Disconnect` applied (and logged) for each present player so the rejoin window starts at resume, and timers re-armed from the stored deadlines. A game the log had already ended is finished at resume. A `running` session without a snapshot is marked `abandoned`. `replay(session_id)` (`scripts/replay_session.py`) rebuilds the game from `resolved_config`, `rng_seed`, `session_questions` and `session_events` and returns the final state, which equals the live one exactly.
 
 ---
 
@@ -250,8 +252,8 @@ Also add a balance simulator: `scripts/simulate_balance.py` runs the pure engine
 - [ ] Leak tests: for seeded games where someone hits 0, the public delta sequence is identical to one computed without the floor
 - [ ] Serializer tests prove no client message ever contains `correct_index` before reveal, any `starting_xp` or total before END, or another player's tokens
 - [ ] A full game plays end to end in the web client with 3 browser tabs
-- [ ] Killing and restarting the API mid-round resumes the session from the Redis snapshot
-- [ ] A disputed game can be replayed from `session_events` to the identical result
+- [x] Killing and restarting the API mid-round resumes the session from the Redis snapshot
+- [x] A disputed game can be replayed from `session_events` to the identical result
 - [ ] Bot run meets the §8 latency and load targets
 - [ ] Balance simulator runs and reports
 - [ ] One real playtest with at least 8 people

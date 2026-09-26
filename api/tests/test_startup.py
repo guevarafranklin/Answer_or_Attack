@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import db as app_db
 from app.auth import verify_admin_user
 from app.config import settings
+from app import main
 from app.main import app, lifespan
 from app.models import User
 
@@ -83,13 +84,16 @@ async def test_lifespan_boots_with_admin_user(
 
 
 @pytest.mark.asyncio
-async def test_lifespan_skips_the_check_when_unset(monkeypatch: pytest.MonkeyPatch):
-    """No ADMIN_USER_ID → no session is even opened."""
+async def test_lifespan_skips_the_check_when_unset(
+    db: AsyncSession, lifespan_session, monkeypatch: pytest.MonkeyPatch
+):
+    """No ADMIN_USER_ID → the check is not run (the resume pass still
+    opens a session to look for running games)."""
     monkeypatch.setattr(settings, "admin_user_id", None)
 
-    def _never():
-        raise AssertionError("SessionLocal must not be used")
+    async def _never(session):
+        raise AssertionError("verify_admin_user must not be called")
 
-    monkeypatch.setattr(app_db, "SessionLocal", _never)
+    monkeypatch.setattr(main, "verify_admin_user", _never)
     async with lifespan(app):
         pass

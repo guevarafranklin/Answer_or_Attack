@@ -10,6 +10,8 @@ builds the per-category pools and the block reserve, persists them to
 session_questions with the per-session option shuffle and the pool each
 row belongs to, and returns the engine-shaped questions plus the payload
 for Redis (`cache_questions` stores it; the caller commits in between).
+`load_draw` rebuilds the same Draw from those rows for a resume after a
+restart and for replays (app.game.persistence, app.game.replay).
 Everything random on the Python side comes from app.game.seed streams of
 `sessions.rng_seed`; the question pick itself is the database's
 random(), and the picked set is what session_questions records.
@@ -83,6 +85,10 @@ _JOIN_CODE_ATTEMPTS = 10
 
 class PackRequired(Exception):
     """study mode needs a pack_id; house mode must not have one."""
+
+
+class NotStarted(Exception):
+    """The session has no draw yet (still a lobby)."""
 
 
 class AlreadyDrawn(Exception):
@@ -414,7 +420,6 @@ async def draw_at_start(
     for pool, drawn in labelled:
         for q in drawn:
             order = shuffle_options(rng)
-            correct = order.index(q.correct_index)
             db.add(
                 SessionQuestion(
                     session_id=session.id,
@@ -424,22 +429,7 @@ async def draw_at_start(
                     pool=pool,
                 )
             )
-            payload.append(
-                SessionQuestionServer(
-                    id=q.id,
-                    stem=q.stem,
-                    options=[q.options[j] for j in order],
-                    correct_index=correct,
-                    ordinal=ordinal,
-                    pool=pool,
-                    difficulty=q.difficulty,
-                )
-            )
-            engine_q = EngineQuestion(str(q.id), str(q.category_id), q.difficulty, correct)
-            if pool == BLOCK_POOL:
-                draw.block_reserve.append(engine_q)
-            else:
-                draw.pools.setdefault(pool, []).append(engine_q)
+            payload.append(_place(draw, ordinal, pool, q, order))
             ordinal += 1
     for cid in pools:  # a category that came up empty still gets its (empty) pool
         draw.pools.setdefault(str(cid), [])
@@ -448,6 +438,69 @@ async def draw_at_start(
         session_id=session.id, locale=session.locale, questions=payload, short_by=short_by or None
     )
     return draw
+
+
+async def load_draw(db: AsyncSession, session: GameSession) -> Draw:
+    """The Draw a started session ran with, rebuilt from what
+    `draw_at_start` persisted: the resolved config and seed on the row,
+    the pools and reserve from session_questions in ordinal order (so the
+    engine sees the categories in the order it did live), the texts from
+    the session's locale. For a resume after a restart and for replays.
+    Raises NotStarted for a lobby."""
+    if session.rng_seed is None or session.resolved_config is None:
+        raise NotStarted()
+    config = config_from(session.resolved_config)
+    draw = Draw(config=config, seed=session.rng_seed)
+    rows = await db.execute(
+        select(
+            SessionQuestion.ordinal,
+            SessionQuestion.pool,
+            SessionQuestion.option_order,
+            Question.id,
+            Question.category_id,
+            Question.difficulty,
+            Question.correct_index,
+            QuestionTranslation.stem,
+            QuestionTranslation.options,
+        )
+        .join(Question, Question.id == SessionQuestion.question_id)
+        .join(
+            QuestionTranslation,
+            and_(
+                QuestionTranslation.question_id == Question.id,
+                QuestionTranslation.locale == session.locale,
+            ),
+        )
+        .where(SessionQuestion.session_id == session.id)
+        .order_by(SessionQuestion.ordinal)
+    )
+    payload = [
+        _place(draw, ordinal, pool, _Drawn(*rest), list(order)) for ordinal, pool, order, *rest in rows
+    ]
+    for cid in session.category_ids:
+        draw.pools.setdefault(str(cid), [])
+    draw.cache = SessionQuestionsCache(session_id=session.id, locale=session.locale, questions=payload)
+    return draw
+
+
+def _place(draw: Draw, ordinal: int, pool: str, q: _Drawn, order: list[int]) -> SessionQuestionServer:
+    """Put one drawn question, with its option shuffle, in the engine's
+    pools or reserve; the cache entry for it."""
+    correct = order.index(q.correct_index)
+    engine_q = EngineQuestion(str(q.id), str(q.category_id), q.difficulty, correct)
+    if pool == BLOCK_POOL:
+        draw.block_reserve.append(engine_q)
+    else:
+        draw.pools.setdefault(pool, []).append(engine_q)
+    return SessionQuestionServer(
+        id=q.id,
+        stem=q.stem,
+        options=[q.options[j] for j in order],
+        correct_index=correct,
+        ordinal=ordinal,
+        pool=pool,
+        difficulty=q.difficulty,
+    )
 
 
 async def cache_questions(redis: Redis, cache: SessionQuestionsCache) -> bool:

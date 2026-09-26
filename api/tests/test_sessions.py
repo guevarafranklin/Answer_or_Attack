@@ -39,6 +39,18 @@ class FakeRedis:
             raise ConnectionError("redis is down")
         self.store[key] = (value, ex)
 
+    async def get(self, key: str) -> bytes | None:
+        """Bytes, like a real client without decode_responses."""
+        if self.down:
+            raise ConnectionError("redis is down")
+        found = self.store.get(key)
+        return found[0].encode() if found is not None else None
+
+    async def delete(self, *keys: str) -> int:
+        if self.down:
+            raise ConnectionError("redis is down")
+        return sum(self.store.pop(k, None) is not None for k in keys)
+
 
 @pytest_asyncio.fixture
 async def player(db: AsyncSession) -> User:

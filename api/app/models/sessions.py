@@ -154,3 +154,26 @@ Index(
     SessionQuestion.pool,
     SessionQuestion.ordinal,
 )
+
+
+class SessionEvent(Base):
+    """Append-only log of every event the engine applied (Phase 2 §6,
+    migration 0007): `seq` is the runtime's applied-event counter, `at_ms`
+    the server time the event was scored at, `kind`/`payload` the engine
+    event (app.game.snapshot). Replaying the rows through the pure engine
+    with the session's seed and resolved config reproduces the game
+    (app.game.replay)."""
+
+    __tablename__ = "session_events"
+    __table_args__ = (
+        UniqueConstraint("session_id", "seq", name="session_events_session_id_seq_key"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("sessions.id", ondelete="CASCADE")
+    )
+    seq: Mapped[int] = mapped_column(Integer)
+    at_ms: Mapped[int] = mapped_column(BigInteger)
+    kind: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)

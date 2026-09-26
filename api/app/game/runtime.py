@@ -34,12 +34,16 @@ The runtime owns:
   is what `Answer.rtt_ms` carries into the engine, where half of it
   comes off the recorded response time. It is never a scoring input;
 * what is not a game event: `sync` is answered here, `report` goes
-  through the report service.
+  through the report service;
+* `resume`: continuing a game from its snapshot after a restart — the
+  state, rng and event counter are restored, every player is marked
+  absent through the engine, and the timers are re-armed from the
+  stored deadlines.
 
 Session status transitions (`lobby → running → finished | abandoned`)
-are the runtime's (§6). The rest of END persistence (players' XP,
-`record_serves`), the Redis snapshot and the event log are steps 7 and
-8: they plug into `RuntimeHooks`.
+are the runtime's (§6). The Redis snapshot and the event log are
+`app.game.persistence`, the rest of END persistence (players' XP,
+`record_serves`) is step 8: they plug into `RuntimeHooks`.
 
 Time is read from a `Clock` so tests can run a whole game in a second
 by speeding it up; nothing here calls `time` directly.
@@ -50,7 +54,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
@@ -64,6 +68,7 @@ from app.game import protocol as proto
 from app.game.config import GameConfig
 from app.game.engine import GameState, Phase
 from app.game.seed import engine_rng
+from app.game.snapshot import Snapshot
 from app.models import GameSession, User
 from app.schemas.telemetry import QuestionReportCreate
 from app.services import reports
@@ -114,21 +119,26 @@ class Socket(Protocol):
 
 
 class RuntimeHooks:
-    """Persistence seams. The defaults do nothing; step 7 (Redis snapshot,
-    event log) and step 8 (END persistence) override them. All are
-    awaited inside the runtime task, so a slow hook slows the game —
-    implementations that touch a store should hand off to a task."""
+    """Persistence seams. The defaults do nothing; `app.game.persistence`
+    (Redis snapshot, event log) and step 8 (END persistence) override
+    them. All are awaited inside the runtime task, so a slow hook slows
+    the game — implementations that touch a store should hand off to a
+    task."""
 
     async def on_event(
         self, rt: SessionRuntime, seq: int, at_ms: int, event: eng.Event, messages: list[eng.Message]
     ) -> None:
-        """One applied event (the event log, step 7)."""
+        """One applied event (the event log)."""
 
     async def on_state(self, rt: SessionRuntime, state: GameState) -> None:
-        """The state after an event (the Redis snapshot, step 7)."""
+        """The state after an event (the Redis snapshot)."""
 
     async def on_end(self, rt: SessionRuntime, ended: eng.Ended) -> None:
         """The game ended (players' XP and record_serves, step 8)."""
+
+    async def on_shutdown(self) -> None:
+        """The process is stopping and every runtime has been stopped:
+        finish whatever is still in flight."""
 
 
 # ---------- inbound queue ----------
@@ -198,6 +208,34 @@ class SessionRuntime:
             await self._close(sock, CLOSE_OVER, "server shutting down")
         self.sockets.clear()
         self._pingers.clear()
+
+    async def resume(self, snap: Snapshot, texts: Mapping[str, proto.QuestionText]) -> None:
+        """Pick a game up from its snapshot after a restart (§3): the
+        state, the rng and the event counter continue where they were
+        (the caller has already brought the snapshot up to the last
+        logged event); nobody is connected, so every player is marked
+        absent *through the engine* — a `Disconnect` at resume time for
+        each present player, logged like any other event so a replay
+        sees what the live game did — and the rejoin window starts now.
+        Timers are re-armed from the stored deadlines: one already past
+        ticks at once. A game the log had already ended is finished
+        here, since its end never reached the DB. Call before
+        `start_task`."""
+        self.state = snap.state
+        self.rng = snap.rng
+        self.seq = snap.seq
+        self.texts = dict(texts)
+        self.shown = {pid: set(qids) for pid, qids in snap.shown.items()}
+        if self.state.phase is Phase.END:
+            await self._finish(eng.ended(self.state))
+            return
+        now = self.clock.now_ms()
+        for p in list(self.state.players.values()):
+            if p.present and not p.dropped:
+                await self._apply(eng.Disconnect(p.id), now)
+                if self.finished:
+                    return
+        self._arm_timer()
 
     # ----- inbound API (called from socket handlers; all just enqueue) -----
 
@@ -525,13 +563,38 @@ class Registry:
     """The live sessions of this process, by join code (single-instance
     MVP, §3). A runtime is created on the first socket to a lobby and
     forgotten when its game ends. A session found `running` in the DB
-    with no runtime here needs the step 7 snapshot to resume; until then
-    it is not live."""
+    with no runtime here is not live: `app.game.persistence.resume`
+    brings such sessions back from their snapshots at startup, through
+    `restore`."""
 
     def __init__(self, *, clock: Clock | None = None, hooks: RuntimeHooks | None = None) -> None:
         self.clock = clock
         self.hooks = hooks
         self._live: dict[str, SessionRuntime] = {}
+
+    async def restore(
+        self, session: GameSession, snap: Snapshot, texts: Mapping[str, proto.QuestionText]
+    ) -> SessionRuntime:
+        """A runtime for a running session, continued from its snapshot
+        (SessionRuntime.resume). Live from here on, unless resuming ended
+        the game outright."""
+        rt = SessionRuntime(
+            session.id,
+            session.join_code,
+            snap.state.config,
+            clock=self.clock,
+            hooks=self.hooks,
+            on_finish=self._forget,
+        )
+        self._live[session.join_code] = rt
+        try:
+            await rt.resume(snap, texts)
+        except BaseException:
+            self._forget(rt)
+            raise
+        if not rt.finished:
+            rt.start_task()
+        return rt
 
     def get(self, join_code: str) -> SessionRuntime | None:
         return self._live.get(join_code)
@@ -565,6 +628,8 @@ class Registry:
         for rt in list(self._live.values()):
             await rt.stop()
         self._live.clear()
+        if self.hooks is not None:
+            await self.hooks.on_shutdown()
 
 
 registry = Registry()

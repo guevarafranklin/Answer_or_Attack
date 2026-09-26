@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "sessions",
     "session_players",
     "session_questions",
+    "session_events",
 }
 
 

@@ -31,9 +31,11 @@ Decisions the spec leaves open, all deliberate and all tested:
   the rng); only with every pool empty do the attacks count as blocked.
 * Dropped players (absent longer than `rejoin_seconds`) are served no
   more questions and cannot be attacked, but stay in the final results.
-* Response time = received − shown − rtt/2, with the player's measured
-  RTT arriving on the Answer event (§5). Tiebreak means use only correct
-  answers to round questions, never blocks.
+* Response time = received − shown − min(rtt/2, MAX_RTT_CREDIT_MS), with
+  the player's measured RTT arriving on the Answer event (§5). The cap
+  bounds what a client that stalls its pongs can gain in the tiebreak.
+  Tiebreak means use only correct answers to round questions, never
+  blocks.
 * "Can pay" for an attack means `xp > 0`, literally per §2.4; the cost is
   floored at 0.
 * The floor itself is a secret: a delta that stops falling would say "this
@@ -54,6 +56,10 @@ from typing import Literal, Protocol
 
 from app.game.config import GameConfig
 from app.rules import OPTION_COUNT
+
+# The most a measured round trip can take off a recorded response time
+# (§5): rtt/2 up to this. A client that slows its pongs buys nothing past it.
+MAX_RTT_CREDIT_MS = 500
 
 
 class Rng(Protocol):
@@ -593,7 +599,7 @@ def _on_answer(s: GameState, ev: Answer, now: int, rng: Rng, out: list[Message])
     record = AnswerRecord(
         option=ev.option,
         received_ms=now,
-        response_ms=max(0, now - s.question_sent_ms - ev.rtt_ms // 2),
+        response_ms=max(0, now - s.question_sent_ms - min(ev.rtt_ms // 2, MAX_RTT_CREDIT_MS)),
     )
     out.append(AnswerAck(p.id, question.id, accepted=True))
     if s.phase is Phase.QUESTION:

@@ -19,6 +19,7 @@ import pytest
 from app.game import engine
 from app.game.config import GameConfig
 from app.game.engine import (
+    MAX_RTT_CREDIT_MS,
     Answer,
     AnswerAck,
     Attack,
@@ -854,6 +855,19 @@ def test_response_time_subtracts_half_the_rtt_and_floors_at_zero():
     assert serves["p0"].response_ms == 850
     assert serves["p1"].response_ms == 0
     assert g.player("p0").correct_response_ms == [850]
+
+
+def test_rtt_credit_is_capped_so_a_stalled_pong_cannot_buy_a_faster_time():
+    g = Game(players=3)
+    g.start()
+    g.pick()
+    g.answer("p0", after_ms=2000, rtt_ms=1000)  # exactly at the cap
+    g.answer("p1", after_ms=2000, rtt_ms=1002)  # one past it
+    g.answer("p2", after_ms=2000, rtt_ms=60_000)  # a client feigning a terrible link
+    serves = {s.player_id: s for s in g.state.serves}
+    assert serves["p0"].response_ms == 1500
+    assert serves["p1"].response_ms == 1500
+    assert serves["p2"].response_ms == 2000 - MAX_RTT_CREDIT_MS == 1500
 
 
 def test_serves_are_recorded_for_every_active_player_each_round():

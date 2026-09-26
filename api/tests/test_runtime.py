@@ -964,5 +964,5 @@ async def test_response_time_takes_off_half_the_measured_rtt(live: World):
     assert all(ans.received_ms == sent + 1_000 for ans in answers.values())
     assert answers[a].response_ms == 950
     assert answers[b].response_ms == 1_000
-    assert answers[c].response_ms == 0  # floored, never negative
+    assert answers[c].response_ms == 1_000 - eng.MAX_RTT_CREDIT_MS  # the credit is capped
     await m.rt.stop()

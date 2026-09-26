@@ -5,8 +5,11 @@ from fastapi import FastAPI
 from app import db
 from app.auth import verify_admin_user
 from app.config import settings
-from app.game import runtime
+from app.game import persistence, runtime
 from app.routers import categories, generation, health, questions, reports, sessions, ws
+
+# Live games write their snapshot and event log through these hooks.
+runtime.registry.hooks = persistence.Persistence()
 
 
 @asynccontextmanager
@@ -17,6 +20,9 @@ async def lifespan(_: FastAPI):
     if settings.admin_user_id is not None:
         async with db.SessionLocal() as session:
             await verify_admin_user(session)
+    # Games that were running when the previous process stopped continue
+    # from their Redis snapshots; those without one are abandoned.
+    await persistence.resume(runtime.registry)
     yield
     await runtime.registry.shutdown()
 
