@@ -388,6 +388,7 @@ class BlockResolved:
     outcome: Outcome
     damage: int  # XP actually lost (after the floor)
     delta: int  # the target's new delta
+    steal: int = 0  # XP each attacker gained (config.attack_steal on a failed block)
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,8 +518,12 @@ def _on_start(s: GameState, ev: Start, now: int, rng: Rng, out: list[Message]) -
     if not s.remaining_categories():
         _err(out, ev.player_id, "no_questions", "no questions were drawn")
         return
+    # The XP spread is picked by the number of players present at Start
+    # (§2.1 balance rationale); players absent but not dropped still play
+    # and draw from the same choices.
+    choices = s.config.choices_for(s.present_count())
     for p in s.players.values():
-        p.starting_xp = p.xp = rng.choice(s.config.starting_xp_choices)
+        p.starting_xp = p.xp = rng.choice(choices)
     _start_round(s, now, rng, out)
 
 
@@ -879,8 +884,10 @@ def _draw_block(s: GameState, rng: Rng) -> Question | None:
 
 def _resolve_blocks(s: GameState, now: int, rng: Rng, out: list[Message]) -> None:
     """§2.4 BLOCK: correct blocks everything; wrong/timeout costs
-    attack_damage per incoming attack, floored at 0. Never touches streaks
-    or tokens. An absent target times out like anyone else (§2.8)."""
+    attack_damage per incoming attack, floored at 0, and pays each
+    attacker attack_steal regardless of how much the target could lose.
+    Never touches streaks or tokens. An absent target times out like
+    anyone else (§2.8)."""
     cfg = s.config
     for block in s.blocks.values():
         target = s.players[block.target_id]
@@ -892,11 +899,14 @@ def _resolve_blocks(s: GameState, now: int, rng: Rng, out: list[Message]) -> Non
             blocked = outcome == "correct"
         else:
             outcome, blocked = "timeout", False
-        damage = 0
+        damage = steal = 0
         if not blocked:
             before = target.xp
             target.xp = max(0, target.xp - cfg.attack_damage * len(block.attacker_ids))
             damage = before - target.xp
+            steal = cfg.attack_steal
+            for attacker_id in block.attacker_ids:
+                s.players[attacker_id].xp += steal
         if q is not None:
             s.serves.append(
                 ServeRecord(
@@ -905,7 +915,7 @@ def _resolve_blocks(s: GameState, now: int, rng: Rng, out: list[Message]) -> Non
             )
         out.append(
             BlockResolved(
-                target.id, tuple(block.attacker_ids), blocked, outcome, damage, target.delta
+                target.id, tuple(block.attacker_ids), blocked, outcome, damage, target.delta, steal
             )
         )
     _start_round(s, now, rng, out)

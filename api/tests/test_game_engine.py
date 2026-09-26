@@ -371,15 +371,47 @@ def test_start_needs_questions():
     assert errors(g.start()) == ["no_questions"]
 
 
-def test_start_draws_secret_starting_xp_from_the_choices():
-    cfg = GameConfig(min_players=2)  # (10, 18, 30)
+def test_start_draws_secret_starting_xp_from_the_explicit_choices():
+    cfg = GameConfig(min_players=2, starting_xp_choices=(10, 18, 30))
     rng = ScriptedRng(choices=[30, 10, 18])
     g = Game(players=3, config=cfg, rng=rng)
     g.start()
     assert [g.player(p).starting_xp for p in ("p0", "p1", "p2")] == [30, 10, 18]
     assert all(p.xp == p.starting_xp and p.delta == 0 for p in g.state.players.values())
-    # each draw was over exactly the configured choices
-    assert rng.choice_calls[:3] == [cfg.starting_xp_choices] * 3
+    # each draw was over exactly the configured choices, tiers ignored
+    assert rng.choice_calls[:3] == [(10, 18, 30)] * 3
+
+
+@pytest.mark.parametrize(
+    ("players", "expected"),
+    [(3, (10, 12, 15)), (8, (10, 12, 15)), (9, (10, 11, 13)), (20, (10, 11, 13))],
+)
+def test_start_picks_the_xp_tier_by_present_player_count(players, expected):
+    rng = ScriptedRng(choices=[expected[0]] * players)
+    g = Game(players=players, config=GameConfig(min_players=2), rng=rng)
+    g.start()
+    assert rng.choice_calls[:players] == [expected] * players
+
+
+def test_xp_tier_counts_present_players_not_seats():
+    """Nine joined, one dropped in the lobby: an 8-player game."""
+    rng = ScriptedRng(choices=[10] * 8)
+    g = Game(players=9, config=GameConfig(min_players=2, rejoin_seconds=2), rng=rng)
+    g.send(Disconnect("p8"))
+    g.tick(at=T0 + 2000)
+    g.start()
+    assert rng.choice_calls[:8] == [(10, 12, 15)] * 8
+
+
+def test_xp_tier_counts_present_players_only_but_deals_to_everyone():
+    """Nine seats, eight present at Start: the 8-player tier. The absent
+    (not yet dropped) player still plays and draws from that same tier."""
+    rng = ScriptedRng(choices=[10] * 9)
+    g = Game(players=9, config=GameConfig(min_players=2), rng=rng)
+    g.send(Disconnect("p8"))
+    g.start()
+    assert rng.choice_calls[:9] == [(10, 12, 15)] * 9
+    assert g.player("p8").starting_xp == 10
 
 
 def test_start_drops_players_who_left_the_lobby_for_good():
@@ -1135,6 +1167,102 @@ def test_block_damage_is_floored_at_zero():
     res = one(g.block_answer("p1", right=False), BlockResolved)
     assert res.damage == 2
     assert g.player("p1").xp == 0
+
+
+STEAL = GameConfig.from_overrides(CFG.summary(), attack_steal=2)
+
+
+def test_attack_steal_can_be_switched_off():
+    g = armed_game(config=GameConfig.from_overrides(CFG.summary(), attack_steal=0))
+    g.send(Attack("p0", "p1"))
+    xp = g.player("p0").xp
+    res = one(g.block_answer("p1", right=False), BlockResolved)
+    assert res.steal == 0
+    assert g.player("p0").xp == xp
+
+
+def test_failed_block_pays_each_attacker_attack_steal():
+    g = Game(players=4, config=STEAL)
+    g.start()
+    g.earn_token("p0", others=("p1",))
+    g.play_question({"p0": True, "p1": True})
+    g.past_reveal()
+    g.send(Attack("p0", "p3"))
+    g.send(Attack("p1", "p3"))
+    xp0, xp1 = g.player("p0").xp, g.player("p1").xp
+    g.player("p3").xp = 10
+    res = one(g.block_answer("p3", right=False), BlockResolved)
+    assert (res.damage, res.steal) == (6, 2)  # target damage is unchanged by the steal
+    assert g.player("p3").xp == 4
+    assert g.player("p0").xp == xp0 + 2
+    assert g.player("p1").xp == xp1 + 2
+
+
+def test_attack_steal_is_paid_on_a_block_timeout():
+    g = armed_game(config=STEAL)
+    g.send(Attack("p0", "p1"))
+    xp = g.player("p0").xp
+    res = one(g.tick(), BlockResolved)
+    assert (res.outcome, res.steal) == ("timeout", 2)
+    assert g.player("p0").xp == xp + 2
+
+
+def test_attack_steal_is_not_paid_when_the_block_succeeds():
+    g = armed_game(config=STEAL)
+    g.send(Attack("p0", "p1"))
+    xp = g.player("p0").xp
+    res = one(g.block_answer("p1", right=True), BlockResolved)
+    assert res.steal == 0
+    assert g.player("p0").xp == xp
+
+
+def test_attack_steal_is_paid_in_full_when_the_target_is_floored():
+    """The steal is a bounty, not a transfer: it does not shrink with the
+    target's remaining XP, so a 0-XP target still pays out (Amendment A)."""
+    g = armed_game(config=STEAL)
+    g.player("p1").xp = 0
+    g.send(Attack("p0", "p1"))
+    xp = g.player("p0").xp
+    res = one(g.tick(), BlockResolved)
+    assert (res.damage, res.steal) == (0, 2)
+    assert g.player("p0").xp == xp + 2
+    assert g.player("p1").xp == 0
+
+
+def test_attack_steal_lifts_an_attacker_off_the_floor():
+    g = armed_game(config=GameConfig.from_overrides(CFG.summary(), attack_steal=3, attack_cost=5))
+    g.player("p0").xp = 1
+    g.send(Attack("p0", "p1"))
+    assert g.player("p0").xp == 0  # cost floored
+    g.tick()
+    assert g.player("p0").xp == 3
+
+
+def test_attack_steal_does_not_touch_streak_or_tokens():
+    g = armed_game(config=STEAL)
+    g.send(Attack("p0", "p1"))
+    streak, tokens = g.player("p0").streak, g.player("p0").tokens
+    g.tick()
+    assert (g.player("p0").streak, g.player("p0").tokens) == (streak, tokens)
+
+
+def test_attack_steal_counts_toward_the_final_ranking():
+    """A stolen point is real XP: it can decide the game and shows in delta."""
+    g = armed_game(
+        config=GameConfig.from_overrides(CFG.summary(), attack_steal=3, attack_cost=1, question_count=4)
+    )
+    g.player("p0").xp = 10
+    g.player("p1").xp = 12
+    g.player("p2").xp = 0
+    g.send(Attack("p0", "p1"))
+    g.tick()  # p1 times out: p1 -> 9, p0 -> 10 - 1 + 3 = 12
+    assert (g.player("p0").xp, g.player("p1").xp) == (12, 9)
+    assert one(g.log, BlockResolved).delta == 9 - 10
+    ended = finish(g)  # one more round, everyone times out
+    assert ended.winner_ids == ("p0",)
+    by_id = {r.player_id: r for r in ended.results}
+    assert (by_id["p0"].final_xp, by_id["p0"].delta) == (11, 1)
+    assert (by_id["p1"].final_xp, by_id["p1"].delta) == (8, -2)
 
 
 def test_block_answers_never_touch_streaks_or_tokens():

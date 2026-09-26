@@ -27,7 +27,11 @@ GameConfig(
     min_players=2,            # 4 for real games; 2 allowed for testing
     max_players=20,
     question_count=15,
-    starting_xp_choices=(10, 18, 30),   # equal probability, secret
+    starting_xp_choices=None, # explicit override; None = pick a tier by present player count
+    starting_xp_tiers=(       # (max_players, choices): first tier covering the count at Start
+        (8, (10, 12, 15)),    #   2–8 players (2–3 = test games)
+        (20, (10, 11, 13)),   #   9–20 players; larger counts reuse the last tier
+    ),                        # equal probability among the choices, secret
     points_correct=3,
     points_wrong=-1,
     points_timeout=-1,
@@ -40,12 +44,20 @@ GameConfig(
     max_tokens=2,
     attack_cost=1,            # XP the attacker pays, win or lose
     attack_damage=3,          # XP the target loses on a failed block
+    attack_steal=2,           # XP each attacker gains on a failed block (bounty, not a transfer)
     max_incoming_attacks=2,   # per target per attack window
     grace_ms=400,             # late-arrival allowance, see §5
     rejoin_seconds=60,
     board_size=4,             # categories offered to the picker each round
 )
 ```
+
+**Balance rationale (2026-09-26, `scripts/simulate_balance.py`, 10,000 games per cell, seed 1; raw numbers in `docs/balance/2026-09-26-grid.json`).** The grid crossed `starting_xp_choices` ∈ {(10,18,30), (10,14,18), (10,12,15)} with `attack_steal` ∈ {0, 2, 3} at 4, 6, 8, 12 and 20 bots of mixed skill, every other field at the values above (the grid ran before the tiers and `attack_steal=2` became defaults, with each cell set as an explicit override). Bots attack per a fixed policy (never / random / greedy-highest-delta), so the attack numbers measure incentives, not human tactics.
+
+- *Starting XP dominated the outcome under the Phase 0 spread.* With (10,18,30) the top bucket won 78% of 4-player games and 97% of 20-player games (2.9× its seat share at 20; the low bucket never won). Tightening to (10,12,15) brought skill↔placement Spearman ρ from ~0.55 to ~0.75 and "best accuracy wins" from 50–69% to 76–89%.
+- *The high bucket's edge grows with table size* because more seats put a strong player in the top bucket more often: with (10,12,15) its lift went 1.19× (4 players) → 1.39× (8) → 1.58× (12) → 1.87× (20). Hence the tiers: (10,12,15) up to 8 players and (10,11,13) above, which holds the high-bucket lift at 1.3–1.5× and "winner had the highest start" near 45–55% across the whole range. **(10,11,12) was rejected** for 20 players: it evens the buckets further (1.27×) but a 2-point spread is less than one correct answer, which makes the secret start cosmetic rather than a mechanic; the 3-point spread keeps it felt while staying below the (10,12,15)-at-8 level.
+- *`attack_steal` = 2 makes attacking break-even; 0 punishes it, 3 rewards it too much.* At 0, "never attack" bots won 1.1–1.7× their seat share (worse with more players); at 3 they fell to 0.67–0.81×. At 2 every policy stayed within ±15% of fair at every table size, and it moved the starting-XP numbers by only 2–4 points. Steal is a bounty paid in full even when the target is at 0 XP (Amendment A), so it never depends on the target's total.
+- Attack volume, block success (40–45% land) and 0-XP frequency (someone hits 0 in ≤6.5% of games) did not react to either knob, so `attack_cost`, `attack_damage` and `max_incoming_attacks` were left alone until the playtest says otherwise.
 
 ### 2.2 Round flow
 
@@ -71,7 +83,7 @@ LOBBY → [host starts] →
 - A target may receive at most `max_incoming_attacks` per window. Extra attacks are refused at declaration (first by server receive time wins), and the refused attacker keeps token and XP.
 - **"Can pay" means XP > 0.** The attacker pays `attack_cost` floored at 0. A holder at 0 XP is refused privately (`no_xp`); nobody else learns of it.
 - **The ATTACK window is skipped when no present player holds a token.** XP is not considered, so skipping never reveals who is broke. A token holder may `pass` instead of attacking; the window ends early once every present token holder has attacked or passed, and one attack *or* pass is allowed per window.
-- BLOCK: each attacked player gets one block question (difficulty 2–3), `block_seconds` to answer. Correct = all incoming attacks blocked. Wrong/timeout = target loses `attack_damage` per incoming attack (floored at 0). Block answers do not affect streaks or tokens.
+- BLOCK: each attacked player gets one block question (difficulty 2–3), `block_seconds` to answer. Correct = all incoming attacks blocked. Wrong/timeout = target loses `attack_damage` per incoming attack (floored at 0) and each attacker gains `attack_steal` in full, even when the target had nothing left to lose. Block answers do not affect streaks or tokens.
 - **Block reserve exhausted:** the block question is drawn from the unused questions of the category pools (difficulty ≥ 2 preferred). Only when every pool is empty too do the attacks count as blocked.
 - Attackers see only whether the block succeeded, never the target's resulting total.
 
