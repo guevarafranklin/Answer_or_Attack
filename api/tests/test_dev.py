@@ -29,6 +29,7 @@ async def test_client_page_is_served_in_dev(client: AsyncClient):
         ("GET", "/dev/client", None),
         ("POST", "/dev/guest", {"display_name": "x"}),
         ("GET", "/dev/categories", None),
+        ("GET", "/dev/sessions/ABCDEF/report", None),
     ],
 )
 async def test_dev_routes_are_404_outside_dev(

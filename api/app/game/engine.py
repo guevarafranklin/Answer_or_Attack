@@ -16,8 +16,13 @@ and leaks nothing by itself because it never talks to a client.
 Decisions the spec leaves open, all deliberate and all tested:
 
 * Every input phase (PICK, QUESTION, ATTACK, BLOCK) ends at
-  `deadline_ms + grace_ms` (§5); REVEAL, which takes no input, ends at its
-  deadline. `state.phase_end_ms` is when the runtime should send `Tick`.
+  `deadline_ms + grace_max_ms` (§5); REVEAL, which takes no input, ends at
+  its deadline. `state.phase_end_ms` is when the runtime should send `Tick`.
+* An answer's own allowance is per player: `config.grace_for(rtt_ms)` from
+  the RTT the runtime stamps on the event (§5), so a slow connection gets
+  more of the window than a fast one and nobody more than `grace_max_ms`.
+  Picks, attacks and passes are not timed against the player and simply
+  count until the phase ends.
 * A phase ends early when nobody present can still act: every present
   player answered, the picker picked, every present token holder attacked
   or passed, every attacked player answered their block.
@@ -592,7 +597,8 @@ def _on_answer(s: GameState, ev: Answer, now: int, rng: Rng, out: list[Message])
     if not 0 <= ev.option < OPTION_COUNT:
         _err(out, p.id, "bad_option", f"option must be 0..{OPTION_COUNT - 1}")
         return
-    if _too_late(s, now):
+    assert s.deadline_ms is not None
+    if now > s.deadline_ms + s.config.grace_for(ev.rtt_ms):
         out.append(AnswerAck(p.id, question.id, accepted=False, reason="too_late"))
         return
     assert s.question_sent_ms is not None
@@ -791,7 +797,7 @@ def _set_phase(
     """Enter `phase` with a fresh deadline; returns the deadline."""
     s.phase = phase
     s.deadline_ms = now + seconds * 1000
-    s.phase_end_ms = s.deadline_ms + (s.config.grace_ms if with_grace else 0)
+    s.phase_end_ms = s.deadline_ms + (s.config.grace_max_ms if with_grace else 0)
     out.append(PhaseChanged(phase, s.round, s.deadline_ms, s.phase_end_ms))
     return s.deadline_ms
 

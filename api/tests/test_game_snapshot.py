@@ -132,7 +132,7 @@ def test_mid_phase_details_survive():
 
 def test_config_overrides_survive():
     cfg = GameConfig.from_overrides(
-        {"starting_xp_choices": [7, 9], "starting_xp_tiers": [[4, [1, 2]], [9, [3]]], "grace_ms": 0}
+        {"starting_xp_choices": [7, 9], "starting_xp_tiers": [[4, [1, 2]], [9, [3]]], "grace_max_ms": 2000}
     )
     g = Game(config=cfg)
     assert snapshot.load_state(json.loads(json.dumps(snapshot.dump_state(g.state)))).config == cfg

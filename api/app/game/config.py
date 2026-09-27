@@ -41,14 +41,20 @@ class GameConfig:
     question_seconds: int = 10
     reveal_seconds: int = 4
     attack_window_seconds: int = 6
-    block_seconds: int = 5
+    block_seconds: int = 7
     streak_for_token: int = 2  # consecutive correct answers to earn a token
     max_tokens: int = 2
     attack_cost: int = 1  # XP the attacker pays, win or lose
     attack_damage: int = 3  # XP the target loses on a failed block
     attack_steal: int = 2  # XP each attacker gains on a failed block (target damage unchanged)
     max_incoming_attacks: int = 2  # per target per attack window
-    grace_ms: int = 400  # late-arrival allowance (§5)
+    # Late-arrival allowance (§5), per player and per answer:
+    #   grace = clamp(rtt_ms // 2 + grace_base_ms, grace_min_ms, grace_max_ms)
+    # from the player's median RTT at that moment (unmeasured: grace_min_ms).
+    # Input phases end at deadline + grace_max_ms so no valid answer is cut off.
+    grace_base_ms: int = 200
+    grace_min_ms: int = 400
+    grace_max_ms: int = 1000
     rejoin_seconds: int = 60
     board_size: int = 4  # categories offered to the picker each round
     # §2.8: fewer than 2 players present for this long ends the session as
@@ -78,10 +84,12 @@ class GameConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ConfigError(f"{name} must be a positive integer, got {value!r}")
-        for name in ("grace_ms", "attack_steal"):
+        for name in ("grace_base_ms", "grace_min_ms", "grace_max_ms", "attack_steal"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ConfigError(f"{name} must be a non-negative integer, got {value!r}")
+        if self.grace_max_ms < self.grace_min_ms:
+            raise ConfigError("grace_max_ms must be at least grace_min_ms")
         if self.min_players < 2:
             raise ConfigError("min_players must be at least 2")
         if self.max_players < self.min_players:
@@ -109,6 +117,11 @@ class GameConfig:
         """Defaults with the given fields replaced. Unknown keys raise
         ConfigError so a typo in a playtest override is loud, not silent."""
         values = {**(overrides or {}), **kwargs}
+        if "grace_ms" in values:
+            # The fixed grace of games before the per-player one: the same
+            # allowance for every RTT, so their logs still replay identically.
+            fixed = values.pop("grace_ms")
+            values = {"grace_base_ms": 0, "grace_min_ms": fixed, "grace_max_ms": fixed, **values}
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(values) - known)
         if unknown:
@@ -120,6 +133,11 @@ class GameConfig:
                 (limit, tuple(choices)) for limit, choices in values["starting_xp_tiers"]
             )
         return replace(cls(), **values)
+
+    def grace_for(self, rtt_ms: int) -> int:
+        """The late-arrival allowance for a player whose median round trip
+        is `rtt_ms` right now (§5): half the trip plus the base, clamped."""
+        return max(self.grace_min_ms, min(self.grace_max_ms, rtt_ms // 2 + self.grace_base_ms))
 
     def choices_for(self, player_count: int) -> tuple[int, ...]:
         """Starting XP choices for a game with this many players present at

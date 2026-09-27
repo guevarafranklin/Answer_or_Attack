@@ -6,6 +6,11 @@ in prod the whole prefix does not exist:
     POST /dev/guest   {display_name}   a throwaway users row → {user_id}
     GET  /dev/categories               active categories with both names,
                                        for the host's picker and the board
+    GET  /dev/sessions/{code}/report   the playtest report of a started
+                                       game (app.game.report): timers used,
+                                       per-question outcomes and response
+                                       times, attack-window delays;
+                                       ?format=json|text for the data
 
 `/dev/guest` is what lets a playtester just type a name: the id it
 returns is the `X-User-Id` the player stub (app.auth.current_player)
@@ -15,15 +20,20 @@ yet (Phase 3), and the client needs names for the ids in `board`.
 """
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import HTMLResponse
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import get_db
-from app.models import User
+from app.game import report as rep
+from app.models import GameSession, User
 from app.services import categories as svc
+from app.services import sessions as sessions_svc
 
 CLIENT_HTML = Path(__file__).resolve().parent.parent / "static" / "dev_client.html"
 
@@ -80,3 +90,27 @@ async def list_categories(db: AsyncSession = Depends(get_db)) -> list[DevCategor
         for c in await svc.list_categories(db)
         if c.is_active
     ]
+
+
+@router.get("/sessions/{join_code}/report", response_class=HTMLResponse)
+async def session_report(
+    join_code: str,
+    format: Literal["html", "json", "text"] = Query("html"),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """404 for an unknown code, 409 for a lobby (no draw, no log yet),
+    500 for a log the engine cannot replay (a gap)."""
+    session = await db.scalar(select(GameSession).where(GameSession.join_code == join_code.upper()))
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Not Found")
+    try:
+        report = await rep.load_report(db, session)
+    except sessions_svc.NotStarted:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=f"session {session.join_code} has not started") from None
+    except rep.ReplayError as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from None
+    if format == "json":
+        return JSONResponse(rep.to_dict(report))
+    if format == "text":
+        return PlainTextResponse(rep.render_text(report))
+    return HTMLResponse(rep.render_html(report))

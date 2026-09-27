@@ -22,14 +22,16 @@ def test_defaults_are_the_spec_values():
         "question_seconds": 10,
         "reveal_seconds": 4,
         "attack_window_seconds": 6,
-        "block_seconds": 5,
+        "block_seconds": 7,
         "streak_for_token": 2,
         "max_tokens": 2,
         "attack_cost": 1,
         "attack_damage": 3,
         "attack_steal": 2,
         "max_incoming_attacks": 2,
-        "grace_ms": 400,
+        "grace_base_ms": 200,
+        "grace_min_ms": 400,
+        "grace_max_ms": 1000,
         "rejoin_seconds": 60,
         "board_size": 4,
         "abandon_seconds": 60,
@@ -76,7 +78,10 @@ def test_is_frozen():
         {"attack_cost": 0},
         {"attack_damage": 0},
         {"max_incoming_attacks": 0},
-        {"grace_ms": -1},
+        {"grace_base_ms": -1},
+        {"grace_min_ms": -1},
+        {"grace_max_ms": -1},
+        {"grace_min_ms": 500, "grace_max_ms": 499},
         {"attack_steal": -1},
         {"attack_steal": 1.0},
         {"rejoin_seconds": 0},
@@ -92,16 +97,39 @@ def test_rejects_unplayable_values(overrides):
 
 
 def test_boundary_values_accepted():
-    GameConfig(min_players=2, max_players=2, grace_ms=0, points_wrong=0, points_timeout=0)
+    GameConfig(min_players=2, max_players=2, grace_base_ms=0, grace_min_ms=0, grace_max_ms=0, points_wrong=0, points_timeout=0)
+    GameConfig(grace_min_ms=700, grace_max_ms=700)
     GameConfig(starting_xp_choices=(0,))
     GameConfig(attack_steal=0)
 
 
 def test_from_overrides_replaces_only_named_fields():
-    cfg = GameConfig.from_overrides({"question_count": 5}, grace_ms=0)
+    cfg = GameConfig.from_overrides({"question_count": 5}, grace_max_ms=2000)
     assert cfg.question_count == 5
-    assert cfg.grace_ms == 0
+    assert cfg.grace_max_ms == 2000
     assert cfg.max_tokens == GameConfig().max_tokens
+
+
+def test_grace_for_is_half_the_rtt_plus_the_base_clamped():
+    cfg = GameConfig()
+    assert cfg.grace_for(0) == 400  # unmeasured or fast: the minimum
+    assert cfg.grace_for(150) == 400  # 75 + 200 is still under it
+    assert cfg.grace_for(800) == 600
+    assert cfg.grace_for(1600) == 1000  # the cap
+    assert cfg.grace_for(10**9) == 1000  # an inflated RTT can't go past it
+
+
+def test_legacy_fixed_grace_ms_maps_to_the_same_allowance_for_everyone():
+    """Games logged before the per-player grace carried `grace_ms` in their
+    resolved config; they must resume and replay with that fixed value."""
+    cfg = GameConfig.from_overrides({"grace_ms": 250, "question_count": 5})
+    assert (cfg.grace_base_ms, cfg.grace_min_ms, cfg.grace_max_ms) == (0, 250, 250)
+    assert cfg.grace_for(0) == cfg.grace_for(5000) == 250
+    assert cfg.question_count == 5
+    assert "grace_ms" not in cfg.summary()
+    # The new fields win over the legacy one when both are given.
+    cfg = GameConfig.from_overrides({"grace_ms": 250, "grace_max_ms": 900})
+    assert (cfg.grace_min_ms, cfg.grace_max_ms) == (250, 900)
 
 
 def test_from_overrides_coerces_choices_to_tuple():

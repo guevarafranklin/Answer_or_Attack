@@ -437,7 +437,7 @@ def test_start_opens_round_one_pick_with_a_board():
     ph = one(msgs, PhaseChanged)
     assert (ph.phase, ph.round) == (Phase.PICK, 1)
     assert g.state.deadline_ms == T0 + CFG.pick_seconds * 1000
-    assert g.state.phase_end_ms == g.state.deadline_ms + CFG.grace_ms
+    assert g.state.phase_end_ms == g.state.deadline_ms + CFG.grace_max_ms
     board = one(msgs, BoardShown)
     assert board.picker_id == "p0"
     assert set(board.category_ids) == set(CATS)  # 3 categories < board_size 4
@@ -469,7 +469,7 @@ def test_pick_shows_the_next_question_of_that_category():
     assert (shown.question_id, shown.category_id) == ("hist-0", "hist")
     assert shown.deadline_ms == T0 + CFG.question_seconds * 1000
     assert g.state.question_sent_ms == T0
-    assert g.state.phase_end_ms == shown.deadline_ms + CFG.grace_ms
+    assert g.state.phase_end_ms == shown.deadline_ms + CFG.grace_max_ms
     assert [q.id for q in g.state.pools["hist"]] == [f"hist-{i}" for i in range(1, 8)]
 
 
@@ -551,11 +551,11 @@ def test_reveal_has_no_grace_but_input_phases_do():
     g.play_question({"p0": True})
     g.past_reveal()
     assert g.phase is Phase.ATTACK
-    assert g.state.phase_end_ms == g.state.deadline_ms + CFG.grace_ms
+    assert g.state.phase_end_ms == g.state.deadline_ms + CFG.grace_max_ms
     g.send(Attack("p0", "p1"))
     assert g.phase is Phase.BLOCK
     assert g.state.deadline_ms == g.now + CFG.block_seconds * 1000
-    assert g.state.phase_end_ms == g.state.deadline_ms + CFG.grace_ms
+    assert g.state.phase_end_ms == g.state.deadline_ms + CFG.grace_max_ms
 
 
 def test_full_round_phase_sequence_without_attacks():
@@ -787,7 +787,8 @@ def test_answer_at_deadline_plus_grace_counts_and_one_ms_later_does_not():
     g = Game()
     g.start()
     g.pick()
-    end = g.state.phase_end_ms
+    end = g.state.deadline_ms + CFG.grace_for(0)  # unmeasured RTT: the minimum grace
+    assert CFG.grace_for(0) == CFG.grace_min_ms == 400
     ack = one(g.send(Answer("p0", g.state.question.id, g.correct()), at=end), AnswerAck)
     assert ack.accepted is True and ack.reason is None
     ack = one(g.send(Answer("p1", g.state.question.id, g.correct()), at=end + 1), AnswerAck)
@@ -799,13 +800,45 @@ def test_answer_at_deadline_plus_grace_counts_and_one_ms_later_does_not():
     assert rev.outcomes["p1"].outcome == "timeout"
 
 
+@pytest.mark.parametrize(
+    ("rtt_ms", "grace_ms"),
+    [
+        (0, 400),  # unmeasured, or a fast player: the minimum
+        (100, 400),  # 50 + 200 is still under it
+        (800, 600),  # half the trip plus the base
+        (3000, 1000),  # a slow player caps at the maximum...
+        (10**9, 1000),  # ...and so does an inflated RTT
+    ],
+)
+def test_grace_is_per_player_from_the_rtt_on_the_answer(rtt_ms, grace_ms):
+    g = Game()
+    g.start()
+    g.pick()
+    qid = g.state.question.id
+    end = g.state.deadline_ms + grace_ms
+    assert end <= g.state.phase_end_ms  # the phase outlives every player's grace
+    ack = one(g.send(Answer("p0", qid, g.correct(), rtt_ms=rtt_ms), at=end), AnswerAck)
+    assert ack.accepted is True
+    ack = one(g.send(Answer("p1", qid, g.correct(), rtt_ms=rtt_ms), at=end + 1), AnswerAck)
+    assert ack.accepted is False and ack.reason == "too_late"
+
+
+def test_phase_ends_at_deadline_plus_grace_max_and_a_slow_answer_fits_in_it():
+    g = Game()
+    g.start()
+    g.pick()
+    assert g.state.phase_end_ms == g.state.deadline_ms + CFG.grace_max_ms
+    ack = one(g.send(Answer("p0", g.state.question.id, 0, rtt_ms=5000), at=g.state.phase_end_ms), AnswerAck)
+    assert ack.accepted is True
+
+
 def test_grace_is_configurable_and_zero_means_the_deadline():
-    cfg = GameConfig.from_overrides(CFG.summary(), grace_ms=0)
+    cfg = GameConfig.from_overrides(CFG.summary(), grace_base_ms=0, grace_min_ms=0, grace_max_ms=0)
     g = Game(config=cfg)
     g.start()
     g.pick()
     assert g.state.phase_end_ms == g.state.deadline_ms
-    ack = one(g.send(Answer("p0", g.state.question.id, 0), at=g.state.deadline_ms + 1), AnswerAck)
+    ack = one(g.send(Answer("p0", g.state.question.id, 0, rtt_ms=5000), at=g.state.deadline_ms + 1), AnswerAck)
     assert ack.accepted is False
 
 
@@ -1340,14 +1373,18 @@ def test_block_answer_validation():
     assert errors(g.send(Answer("p1", qid, 7))) == ["bad_option"]
     ack = one(g.send(Answer("p1", qid, 0), at=g.state.phase_end_ms + 1), AnswerAck)
     assert ack.accepted is False and ack.reason == "too_late"
-    g.send(Answer("p1", qid, 0), at=g.state.phase_end_ms)  # within grace
+    g.send(Answer("p1", qid, 0), at=g.state.deadline_ms + CFG.grace_for(0))  # within grace
     assert g.phase is Phase.PICK
 
 
 def test_block_answer_within_grace_is_accepted():
     g = armed_game()
     g.send(Attack("p0", "p1"))
-    ack = one(g.send(Answer("p1", "blk-0", 0), at=g.state.phase_end_ms), AnswerAck)
+    ack = one(g.send(Answer("p1", "blk-0", 0), at=g.state.deadline_ms + CFG.grace_for(0)), AnswerAck)
+    assert ack.accepted
+    g = armed_game()
+    g.send(Attack("p0", "p1"))
+    ack = one(g.send(Answer("p1", "blk-0", 0, rtt_ms=1600), at=g.state.phase_end_ms), AnswerAck)
     assert ack.accepted
 
 

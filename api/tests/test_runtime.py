@@ -855,14 +855,14 @@ async def test_real_clients_are_pinged_on_connect_and_their_echo_is_measured(liv
     assert 0 <= rt._rtt_ms(bots[0].player_id) < 1000 * SPEED
 
 
-# ---------- §5: acceptance at deadline + grace ----------
+# ---------- §5: acceptance at deadline + the player's grace ----------
 
 
 @pytest.mark.asyncio
 async def test_answers_are_judged_by_their_enqueue_stamp(live: World):
     """An answer stamped at deadline+grace-1 on arrival is accepted even
     if the queue only gets to it after the window has passed."""
-    m = await manual(live, grace_ms=1500)
+    m = await manual(live, grace_base_ms=0, grace_min_ms=1500, grace_max_ms=1500)
     a, b, c = m.pids
     await m.start()
     qid = await m.pick()
@@ -886,7 +886,7 @@ async def test_answers_are_judged_by_their_enqueue_stamp(live: World):
 
 @pytest.mark.asyncio
 async def test_answer_at_deadline_plus_grace_minus_one_is_accepted_and_plus_one_is_too_late(live: World):
-    m = await manual(live, grace_ms=400)
+    m = await manual(live, grace_base_ms=0, grace_min_ms=400, grace_max_ms=400)
     a, b, c = m.pids
     await m.start()
     qid = await m.pick()
@@ -911,13 +911,13 @@ async def test_answer_at_deadline_plus_grace_minus_one_is_accepted_and_plus_one_
 
 
 @pytest.mark.asyncio
-async def test_the_question_ends_at_deadline_plus_grace_unless_everyone_answered(live: World):
-    m = await manual(live, grace_ms=400, question_count=2)
+async def test_the_question_ends_at_deadline_plus_grace_max_unless_everyone_answered(live: World):
+    m = await manual(live, grace_min_ms=400, grace_max_ms=1000, question_count=2)
     a, b, c = m.pids
     await m.start()
     qid = await m.pick()
     deadline, end = m.rt.state.deadline_ms, m.rt.state.phase_end_ms
-    assert deadline is not None and end == deadline + 400
+    assert deadline is not None and end == deadline + 1000
     # Nobody answers: the deadline itself changes nothing, the grace does.
     await m.tick_to(deadline)
     assert m.rt.state.phase is eng.Phase.QUESTION
@@ -941,6 +941,71 @@ async def test_the_question_ends_at_deadline_plus_grace_unless_everyone_answered
         m.answer(pid, qid)
     await settled(m.rt)
     assert m.rt.state.phase is eng.Phase.REVEAL and m.clock.t == deadline - 5_000
+    await m.rt.stop()
+
+
+@pytest.mark.asyncio
+async def test_each_players_grace_follows_their_measured_rtt(live: World):
+    """§5: grace = clamp(rtt // 2 + 200, 400, 1000) from the median RTT
+    at the moment of the answer. A fast player gets 400, one at 800 ms
+    gets 600, a slow one is capped at 1000 — and so is one whose pongs
+    are held back to inflate the RTT. The phase runs to deadline + 1000
+    so nobody's window is cut short."""
+
+    async def measure(m: Manual) -> None:
+        a, b, c = m.pids
+        for i in range(5):
+            await m.pong(a, i, 0)  # a: instant (the clock only moves forward: echo each in turn)
+        for i in range(5):
+            await m.pong(b, i, 800)  # b: 800 ms round trip
+        for i in range(5):
+            await m.pong(c, i, 5_000)  # c: pongs held back five seconds
+        assert (m.rt._rtt_ms(a), m.rt._rtt_ms(b), m.rt._rtt_ms(c)) == (0, 800, 5_000)
+
+    m = await manual(live)  # the defaults: 200 / 400 / 1000
+    a, b, c = m.pids
+    await measure(m)
+    cfg = m.rt.state.config
+    assert (cfg.grace_for(0), cfg.grace_for(800), cfg.grace_for(5_000)) == (400, 600, 1000)
+
+    await m.start()
+    qid = await m.pick()
+    deadline = m.rt.state.deadline_ms
+    assert deadline is not None and m.rt.state.phase_end_ms == deadline + 1000
+
+    # a is over their 400 at +401; b still has until +600; c until +1000.
+    await m.tick_to(deadline + 401)
+    for pid in (a, b, c):
+        m.answer(pid, qid)
+    await settled(m.rt)
+    acks = {pid: m.socks[pid].of("answer_ack")[-1] for pid in (a, b, c)}
+    assert acks[a]["accepted"] is False and acks[a]["reason"] == "too_late"
+    assert acks[b]["accepted"] is True and acks[c]["accepted"] is True
+    assert m.rt.state.phase is eng.Phase.QUESTION  # a's rejection does not close the phase
+    await m.rt.stop()
+
+    # The 800 ms player is late at +601; the slow one is late at +1001,
+    # not a millisecond later however slow their pongs were.
+    m = await manual(live)
+    a, b, c = m.pids
+    await measure(m)
+    await m.start()
+    qid = await m.pick()
+    deadline = m.rt.state.deadline_ms
+    assert deadline is not None
+    await m.tick_to(deadline + 601)
+    m.answer(b, qid)
+    await settled(m.rt)
+    assert m.socks[b].of("answer_ack")[-1]["reason"] == "too_late"
+    await m.tick_to(deadline + 999)
+    m.answer(c, qid)
+    await settled(m.rt)
+    assert m.socks[c].of("answer_ack")[-1]["accepted"] is True
+    assert m.rt.state.phase is eng.Phase.QUESTION
+    await m.tick_to(deadline + 1000)  # the timer closes the phase at deadline + grace_max
+    assert m.rt.state.phase is eng.Phase.REVEAL
+    outcomes = {pid: m.socks[pid].of("reveal")[-1]["outcome"] for pid in (a, b, c)}
+    assert outcomes[a] == outcomes[b] == "timeout" and outcomes[c] in ("correct", "incorrect")
     await m.rt.stop()
 
 

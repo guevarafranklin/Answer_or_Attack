@@ -563,7 +563,7 @@ function panelFor(phase, my) {
         <td>${i + 1}</td><td>${esc(r.display_name)}${r.player_id === my ? ' (you)' : ''}</td><td>${r.starting_xp}</td><td>${r.final_xp}</td>
         <td>${fmtDelta(r.delta)}</td><td>${fmtDelta(r.nominal_delta)}</td><td>${r.mean_correct_ms == null ? '–' : Math.round(r.mean_correct_ms)}</td></tr>`).join('');
       return `<div class="box"><p class="big">🏆 ${winners || 'nobody'}</p>
-        <p class="muted">${esc(e.reason)} · tiebreak: ${esc(e.tiebreak || 'none')}</p>
+        <p class="muted">${esc(e.reason)} · tiebreak: ${esc(e.tiebreak || 'none')} · <a href="/dev/sessions/${encodeURIComponent(store.seat.join_code)}/report" target="_blank">game report</a></p>
         <div class="tablewrap"><table><thead><tr><th>#</th><th>player</th><th>start</th><th>final</th><th>real Δ</th><th>nominal Δ</th><th>mean correct ms</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
     }
   }

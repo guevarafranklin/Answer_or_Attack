@@ -12,6 +12,7 @@ finished game.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,11 +29,31 @@ class ReplayError(Exception):
     pass
 
 
+LoggedEvent = tuple[int, int, str, dict[str, Any]]  # seq, at_ms, kind, payload
+
+
+async def load_events(db: AsyncSession, session: GameSession) -> list[LoggedEvent]:
+    """The session's log in order, checked for gaps (a replay of half the
+    events proves nothing)."""
+    rows = (
+        await db.execute(
+            select(SessionEvent.seq, SessionEvent.at_ms, SessionEvent.kind, SessionEvent.payload)
+            .where(SessionEvent.session_id == session.id)
+            .order_by(SessionEvent.seq)
+        )
+    ).all()
+    expected = 1
+    for seq, *_ in rows:
+        if seq != expected:
+            raise ReplayError(f"session {session.join_code}: event log jumps from seq {expected - 1} to {seq}")
+        expected += 1
+    return [tuple(r) for r in rows]  # type: ignore[misc]
+
+
 async def replay(db: AsyncSession, session_id: uuid.UUID) -> GameState:
     """The engine state after every logged event of the session, in
     order. Raises ReplayError for an unknown or never-started session,
-    or a log with a gap in it (a replay of half the events proves
-    nothing)."""
+    or a log with a gap in it."""
     session = await db.get(GameSession, session_id)
     if session is None:
         raise ReplayError(f"no session {session_id}")
@@ -40,20 +61,10 @@ async def replay(db: AsyncSession, session_id: uuid.UUID) -> GameState:
         draw = await svc.load_draw(db, session)
     except svc.NotStarted:
         raise ReplayError(f"session {session.join_code} never started") from None
-    rows = (
-        await db.execute(
-            select(SessionEvent.seq, SessionEvent.at_ms, SessionEvent.kind, SessionEvent.payload)
-            .where(SessionEvent.session_id == session_id)
-            .order_by(SessionEvent.seq)
-        )
-    ).all()
+    rows = await load_events(db, session)
     state = eng.new_game(draw.config, draw.pools, draw.block_reserve)
     rng = engine_rng(draw.seed)
-    expected = 1
-    for seq, at_ms, kind, payload in rows:
-        if seq != expected:
-            raise ReplayError(f"session {session.join_code}: event log jumps from seq {expected - 1} to {seq}")
-        expected += 1
+    for _, at_ms, kind, payload in rows:
         event = snapshot.decode_event(kind, payload)
         state, _ = eng.step(state, event, at_ms, rng, copy_state=False)
     return state

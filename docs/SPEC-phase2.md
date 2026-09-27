@@ -39,14 +39,16 @@ GameConfig(
     question_seconds=10,
     reveal_seconds=4,
     attack_window_seconds=6,
-    block_seconds=5,
+    block_seconds=7,          # 5 was too tight over a slow link, see §5
     streak_for_token=2,       # consecutive correct answers to earn a token
     max_tokens=2,
     attack_cost=1,            # XP the attacker pays, win or lose
     attack_damage=3,          # XP the target loses on a failed block
     attack_steal=2,           # XP each attacker gains on a failed block (bounty, not a transfer)
     max_incoming_attacks=2,   # per target per attack window
-    grace_ms=400,             # late-arrival allowance, see §5
+    grace_base_ms=200,        # late-arrival allowance, per player: see §5
+    grace_min_ms=400,         #   grace = clamp(rtt/2 + base, min, max)
+    grace_max_ms=1000,        #   input phases end at deadline + max
     rejoin_seconds=60,
     board_size=4,             # categories offered to the picker each round
 )
@@ -189,9 +191,17 @@ Two measurements, two owners. The **server measures each player's round trip** i
   4. Re-sync every 30 s the same way. Adopt the new offset if its best sample's rtt is no worse than the one in use, or if the one in use is older than 60 s (so a drifting clock is still corrected).
   5. Render every countdown as `deadline_ms − (now() + offset)`. Show the countdown reaching 0 at `deadline_ms`; the server's grace is invisible to the player.
   The client's `sync` cadence is its own business; the server answers every `sync` and never acts on it.
-- **Acceptance rule.** The server stamps each answer on receipt — the stamp is put on the message when it is taken off the socket and enqueued, before anything else in the queue is applied, so a busy runtime cannot make an answer late. An answer counts if `received_ms ≤ deadline_ms + grace_ms`. No client timestamps are trusted.
-- **Why grace, not client time:** trusting client timestamps lets a modified client answer after seeing others react. A fixed grace window is honest and simple. `grace_ms` is tuned in playtests with the latency bots (§8).
-- **The phase ends at `deadline_ms + grace_ms`,** not at `deadline_ms`, so late-but-valid answers are never cut off: the runtime's timer ticks at `phase_end_ms = deadline_ms + grace_ms`, and the tick is queued behind any answer that arrived first. If every present player has answered, the phase ends early. REVEAL takes no input and ends at its deadline.
+- **Acceptance rule.** The server stamps each answer on receipt — the stamp is put on the message when it is taken off the socket and enqueued, before anything else in the queue is applied, so a busy runtime cannot make an answer late. An answer counts if `received_ms ≤ deadline_ms + grace_ms`, where the grace is **per player, computed at each answer** from the player's current median RTT:
+
+  ```
+  grace_ms = clamp(rtt_ms // 2 + grace_base_ms, grace_min_ms, grace_max_ms)   # defaults 200 / 400 / 1000
+  ```
+
+  A player with no RTT sample yet (or a fast one) gets `grace_min_ms`; at 800 ms RTT the grace is 600 ms; a slow link caps at `grace_max_ms`. No client timestamps are trusted.
+- **Why grace, not client time:** trusting client timestamps lets a modified client answer after seeing others react. A grace window is honest and simple; making it follow the measured RTT gives a slow player the same effective window as a fast one without handing everybody a second of slack. The RTT is the server's own measurement and a client can only inflate it (see above), which buys at most `grace_max_ms` — a cap, not a lever. The three values were tuned with the latency bots (§8).
+- **The phase ends at `deadline_ms + grace_max_ms`,** not at `deadline_ms`, so no valid answer is ever cut off whatever the player's grace: the runtime's timer ticks at `phase_end_ms = deadline_ms + grace_max_ms`, and the tick is queued behind any answer that arrived first. If every present player has answered, the phase ends early. REVEAL takes no input and ends at its deadline. Picks, attacks and passes are not timed against a player and simply count until the phase ends.
+- **Legacy games.** Sessions logged before this change carry a fixed `grace_ms` in `resolved_config`; `GameConfig.from_overrides` maps it to `grace_base_ms=0, grace_min_ms=grace_max_ms=grace_ms`, so they resume and replay exactly as they were played.
+- **Bot results (2026-09-26, `scripts/bots.py`, 6 bots × 3 sessions, network profile 800±300, accuracy 0.7, greedy attacks, 10 questions, defaults otherwise).** With the previous fixed 400 ms grace, human-speed bots (taps 3500±1500 ms after the question) had 4 of 200 on-time answers rejected (2.0%, all on the 5-second block questions), and bots tapping uniformly over the whole window (500–9900 ms) had 14 of 168 rejected (8.3%): a one-way delay of 500–1100 ms simply cannot fit in 400 ms. With the adaptive grace and `block_seconds=7`: **human-speed 0 of 217 on-time answers rejected (0.0%)** and **uniform 0 of 181 (0.0%)**, the closest accepted on-time tap being sent with 43 ms of countdown left; timer ticks fired within 1–3 ms of `phase_end_ms`. Both meet the §8 target.
 - **Response time** recorded for telemetry and used by the tiebreak = `max(0, received_ms − question_sent_ms − min(rtt / 2, 500))`, with the player's median RTT at the moment the answer is applied. The 500 ms cap bounds what a client that stalls its pongs (inflating its RTT) can gain in the tiebreak. It never affects points.
 
 ---
@@ -242,6 +252,8 @@ This client is thrown away after Phase 3. Don't polish it.
 
 Report per run: answers rejected as late per network profile, mean phase-transition lag, server CPU, and a game summary. **Target: at 800±300ms with the default grace, fewer than 2% of on-time human-speed answers rejected**, and 20 bots × 10 concurrent sessions with phase transitions lagging under 100ms.
 
+As measured (2026-09-26): 0% on-time rejections at 800±300 with the default grace, both at human speed and with taps spread over the whole window (§5 has the numbers); 20 × 10 at profile 0 with tick lag mean 1.1 ms (max 7 ms), arrival lag mean 9.4 ms (max 38 ms), server CPU mean 17.5% of one core (busiest second 88%), 160 MB RSS, all 10 games finished. The bots run against a second API on the test database, never the dev one.
+
 Also add a balance simulator: `scripts/simulate_balance.py` runs the pure engine for 10,000 games with bots of mixed skill and reports how often the winner is decided by starting XP versus play, attack usage, and how often players hit 0. This is how you tune `starting_xp_choices`, `attack_cost`, and `attack_damage` without 10,000 human games.
 
 ---
@@ -254,8 +266,8 @@ Also add a balance simulator: `scripts/simulate_balance.py` runs the pure engine
 - [ ] A full game plays end to end in the web client with 3 browser tabs
 - [x] Killing and restarting the API mid-round resumes the session from the Redis snapshot
 - [x] A disputed game can be replayed from `session_events` to the identical result
-- [ ] Bot run meets the §8 latency and load targets
-- [ ] Balance simulator runs and reports
+- [x] Bot run meets the §8 latency and load targets
+- [x] Balance simulator runs and reports
 - [ ] One real playtest with at least 8 people
 
 ---
